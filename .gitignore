@@ -9,3 +9,6 @@ __pycache__/
 .pytest_cache/
 server/.data/
 server/secrets/
+
+# Supabase CLI scratch
+supabase/.temp/
