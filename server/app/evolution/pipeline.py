@@ -212,7 +212,10 @@ def _finish(ctx: EvolutionContext, run_id: str, status: str, stats: dict[str, An
 
 
 def should_trigger(ctx: EvolutionContext, now_ts: float, last_run_ts: float | None) -> str | None:
-    """Worker policy: a threshold of new interactions, or the schedule with anything new."""
+    """Worker policy: a threshold of new interactions, or the schedule with anything new.
+    Never two runs within EVOLUTION_MIN_GAP_S (a run that keeps failing can't spin)."""
+    if last_run_ts is not None and now_ts - last_run_ts < ctx.settings.evolution_min_gap_s:
+        return None
     pending = ctx.repo.count_untrained_interactions()
     if pending >= ctx.settings.evolution_min_new_logs:
         return "threshold"

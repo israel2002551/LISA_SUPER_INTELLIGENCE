@@ -86,3 +86,15 @@ def test_trigger_endpoint_and_worker_policy(client, ctx):
     assert r.status_code == 200 and r.json()["executor"] == "worker"
     assert ctx.repo.next_queued_run()["params"] == {"force_publish": True}
     assert should_trigger(ctx, 0.0, None) is None             # nothing new to learn from
+
+
+def test_worker_policy_threshold_and_min_gap(client, ctx):
+    headers = register(client)
+    _ingest(client, headers, [device_event(1)] + [interaction_event(10 + i, 20.0, "NOP", "nop") for i in range(3)])
+    ctx.settings.evolution_min_new_logs = 3
+    assert should_trigger(ctx, 10_000.0, None) == "threshold"
+    assert should_trigger(ctx, 10_000.0, 10_000.0 - 60) is None        # a run started a minute ago
+    assert should_trigger(ctx, 10_000.0, 10_000.0 - 601) == "threshold"
+    ctx.settings.evolution_min_new_logs = 100
+    assert should_trigger(ctx, 10_000.0, 10_000.0 - 601) is None       # under threshold, schedule not due
+    assert should_trigger(ctx, 100_000.0, 0.0) == "schedule"

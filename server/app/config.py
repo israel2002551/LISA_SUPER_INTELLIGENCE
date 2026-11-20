@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     run_evolution_inline: bool | None = None           # None: inline in dev mode, worker otherwise
     evolution_min_new_logs: int = 200                  # worker: start a run after this many new interactions
     evolution_interval_s: int = 6 * 3600               # worker: or after this long, if anything is new
+    evolution_min_gap_s: int = 600                     # worker: never start runs closer together than this
     worker_poll_s: int = 30
     curate_batch: int = 5000
     synth_per_device: int = 64

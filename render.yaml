@@ -1,18 +1,22 @@
-# Render Blueprint: LISA evolution server for the self-evolving edge nodes.
+# Render Blueprint: LISA API on Render's FREE plan.
 # New -> Blueprint -> pick this repo. Fill the env group values marked sync:false.
 #
-#   lisa-api     FastAPI: telemetry, OTA checks, UART classify, admin
-#   lisa-worker  runs evolution runs (curate -> train -> quantize -> publish)
+#   lisa-api   FastAPI (free web service): telemetry, OTA checks, UART classify, admin
 #
-# Both talk to Supabase; neither stores state locally. tokenizer.bin must be in
-# the repo root OR uploaded once with server/scripts/bootstrap_model.py.
+# Training does NOT run on Render (free accounts have no background workers).
+# It runs on GitHub Actions (.github/workflows/lisa-evolution.yml) or on your PC
+# (cd server && python worker.py). The worker only needs Supabase, not Render.
+#
+# Free web services sleep after 15 minutes without traffic. A device online
+# sends telemetry at least every minute, which keeps it awake; after a sleep the
+# first request can take ~1 minute and the device simply retries.
 
 services:
   - type: web
     name: lisa-api
     runtime: python
     rootDir: server
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
@@ -20,21 +24,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.13.2
       - key: RUN_EVOLUTION_INLINE
-        value: "false"          # the worker trains; the API only queues runs
-      - fromGroup: lisa
-
-  - type: worker
-    name: lisa-worker
-    runtime: python
-    rootDir: server
-    plan: standard              # torch + training need more than 512 MB RAM
-    buildCommand: pip install -r requirements-train.txt
-    startCommand: python worker.py
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.13.2
-      - key: TRAINER
-        value: torch            # mock = dry-run the pipeline without ML; remote = external GPU hook
+        value: "false"          # never train inside the API (512 MB, shared CPU); runs are queued
       - fromGroup: lisa
 
 envVarGroups:
@@ -46,13 +36,7 @@ envVarGroups:
         sync: false
       - key: ADMIN_TOKEN
         generateValue: true
-      - key: OTA_SIGNING_KEY_PEM          # python server/scripts/gen_signing_key.py
+      - key: OTA_SIGNING_KEY_PEM          # contents of server/secrets/ota_signing_key.pem
         sync: false
       - key: TEACHER
-        value: rule                       # claude: also set ANTHROPIC_API_KEY
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: AUTO_ACTIVATE
-        value: "true"
-      - key: EVOLUTION_MIN_NEW_LOGS
-        value: "200"
+        value: rule

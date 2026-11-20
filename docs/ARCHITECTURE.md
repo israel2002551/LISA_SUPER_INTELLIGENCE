@@ -3,12 +3,12 @@
 Three parts form one learning loop:
 
 ```
- ┌──────────── ESP32-S3 edge node (edge/) ────────────┐        ┌──────── Render (server/) ────────┐
- │ Core 1  inference_task   Gemma INT16 in PSRAM       │ HTTPS  │ lisa-api (FastAPI)      │
+ ┌──────────── ESP32-S3 edge node (edge/) ────────────┐        ┌──── Render, free plan (server/) ──┐
+ │ Core 1  inference_task   Gemma INT16 in PSRAM       │ HTTPS  │ lisa-api (FastAPI)                │
  │ Core 0  uart_task        auto-baud, IDENTIFY,       │───────►│  POST /telemetry   GET /ota/check │
  │                          bus upgrade, actions       │◄───────│  POST /uart/classify  admin/*     │
- │         ring_task        logs -> W25Q Partition C   │        │                                   │
- │         net_task         telemetry, OTA, classify   │        │ lisa-worker             │
+ │         ring_task        logs -> W25Q Partition C   │        ├── GitHub Actions (or your PC) ────┤
+ │         net_task         telemetry, OTA, classify   │        │ worker.py --once, every 6 h       │
  │                                                     │        │  curate -> synthesize -> train    │
  │ W25Q128 on SPI2: control | slot A | slot B | ring   │        │  -> gate -> quantize -> sign      │
  └───────────────▲─────────────────────────────────────┘        └──────────────┬───────────────────┘
@@ -78,7 +78,8 @@ server/                        Render service
   scripts/                     gen_signing_key, register_node, bootstrap_model, simulate_node
   tests/                       39 fast tests + 1 slow real-training test
 tools/fake_peripheral.py       smart/raw UART device simulator for bring-up
-render.yaml                    Render blueprint (api + worker)
+render.yaml                    Render blueprint (free web service: the API)
+.github/workflows/             (LISA repo) lisa-evolution.yml: the training worker on GitHub Actions
 ```
 
 ## 2. Edge node
@@ -200,5 +201,6 @@ It also helps `/uart/classify` when the heuristics aren't confident.
 **Limits:**
 - **Speed:** the model is tiny (2.75M parameters), and a compact JSON action is ~35 tokens, each a full forward pass on the device. A shorter action syntax would cut that by ~3×.
 - **Fast links:** ESP-NOW/TCP/SPI bus upgrades are a hook, not an implementation.
-- **Worker:** run one worker only; runs aren't locked.
+- **Worker:** run one worker only; runs aren't locked. The GitHub Actions workflow enforces this with a `concurrency` group; don't also run `worker.py` on your PC at the same time.
+- **Free Render plan:** the API sleeps after 15 minutes without traffic. An online device keeps it awake; after a sleep the first request takes up to about a minute, and the device retries from its ring log.
 - **TLS:** the device needs the root CA PEMs for your Render and Supabase hosts in `secrets.h` (see `BRINGUP.md`).

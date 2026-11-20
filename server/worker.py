@@ -22,6 +22,7 @@ from app.evolution.pipeline import create_run, run_evolution, should_trigger
 from app.main import build_context
 
 log = logging.getLogger("worker")
+failed_runs: list[str] = []
 
 
 def _last_run_ts(ctx) -> float | None:
@@ -38,6 +39,8 @@ def tick(ctx) -> bool:
         log.info("running queued evolution run %s", run["id"])
         result = run_evolution(ctx, run["id"])
         log.info("run %s finished: %s %s", run["id"], result.get("status"), result.get("error") or "")
+        if result.get("status") == "failed":
+            failed_runs.append(run["id"])
         return True
     trigger = should_trigger(ctx, time.time(), _last_run_ts(ctx))
     if trigger:
@@ -47,18 +50,29 @@ def tick(ctx) -> bool:
     return False
 
 
+MAX_STEPS_PER_ONCE = 6   # --once: create + finish at most 3 runs, so a broken run can't loop forever
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--once", action="store_true", help="process the queue / policy, then exit (cron, CI)")
+    parser.add_argument("--trigger", action="store_true", help="start a manual evolution run first")
+    parser.add_argument("--force", action="store_true", help="with --trigger: publish even if the gate rejects")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
     ctx = build_context(settings)
     if settings.dev_mode:
         log.warning("Worker in dev mode has its own in-memory database; it can't see the web service's data.")
+    if args.trigger:
+        run = create_run(ctx, "manual", {"force_publish": True} if args.force else {})
+        log.info("created manual run %s%s", run["id"], " (force publish)" if args.force else "")
     if args.once:
-        while tick(ctx):
-            pass
+        for _ in range(MAX_STEPS_PER_ONCE):
+            if not tick(ctx):
+                break
+        if failed_runs:   # "rejected" by the gate is normal; "failed" is a bug or outage
+            raise SystemExit(f"evolution run(s) failed: {', '.join(failed_runs)}")
         return
     while True:
         if not tick(ctx):

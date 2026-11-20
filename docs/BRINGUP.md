@@ -11,7 +11,7 @@ Bring the system up one layer at a time. Each step has a check that must pass be
 | 5 | + USB-UART adapter | auto-baud, IDENTIFY, bus upgrade, actions, ring log |
 | 6 | + Wi-Fi | telemetry into Supabase |
 | 7 | all of the above | evolution → OTA delta → trial → commit/rollback |
-| 8 | Render | production deployment |
+| 8 | Render (free) + GitHub Actions | production deployment at no cost |
 
 ---
 
@@ -135,14 +135,23 @@ Then run `/ota` on the device console, or wait 5 minutes.
 - **Server-side:** `POST /api/v1/admin/models/1/activate`, and devices converge back to v1.
 - **Device-side:** a model that fails its self-test, or reboots 3 times before committing, is rolled back automatically.
 
-## 8. Render
+## 8. Deploy for free (Render + GitHub Actions)
 
-1. Push the repo, including `tokenizer.bin`, or let `bootstrap_model.py` upload it to storage.
-2. In Render: **New → Blueprint** and select the repo. `render.yaml` creates `lisa-api` (starter plan) and `lisa-worker` (standard plan, CPU torch).
-3. Fill the `lisa` env group: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `OTA_SIGNING_KEY_PEM`. `ADMIN_TOKEN` is generated.
-4. **Check:**
-   - `https://<api>.onrender.com/healthz` returns `dev_mode: false`;
-   - a triggered run is picked up by the worker (its logs show `running queued evolution run`).
-5. **Optional:**
-   - `TEACHER=claude` + `ANTHROPIC_API_KEY` for LLM labels and stream classification;
-   - `TRAINER=remote` + `REMOTE_TRAINER_URL` for an external GPU worker (contract in `server/app/evolution/trainer.py`).
+**API on Render (free web service):**
+1. **New → Blueprint** and select the repo. `render.yaml` creates one service, `lisa-api`, on the free plan.
+2. Fill the `lisa` env group: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `OTA_SIGNING_KEY_PEM` (the full contents of `server/secrets/ota_signing_key.pem`). `ADMIN_TOKEN` is generated.
+3. **Check:** `https://<api>.onrender.com/healthz` returns `"ai": "LISA"`, `"dev_mode": false`, `"active_model": 1`.
+
+**Training on GitHub Actions (free for public repos):**
+1. In the GitHub repo: **Settings → Secrets and variables → Actions → New repository secret**. Add `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `OTA_SIGNING_KEY_PEM`, with the same values as on Render.
+2. **Actions → LISA evolution → Run workflow.**
+   - `train_now` starts a run immediately.
+   - `force_publish` ships the result even if it doesn't beat the current model; leave it off normally.
+3. The schedule also runs every 6 hours, and starts training when enough new experience has arrived (`EVOLUTION_MIN_NEW_LOGS`) or the interval has passed.
+4. **Check:** the job log ends with `run ... finished: published` (or `rejected` with the gate's reason). A new row appears in `model_versions`.
+
+**Alternative: train on your PC.** `cd server && python worker.py --once --trigger` uses `server/.env` and your CPU, which takes ~3 minutes. Don't run it at the same time as the GitHub workflow.
+
+**Optional:**
+- `TEACHER=claude` + `ANTHROPIC_API_KEY` for LLM labels and stream classification. On Render, set them in the env group; on Actions, use a repository variable plus a secret.
+- `TRAINER=remote` + `REMOTE_TRAINER_URL` for an external GPU worker (contract in `server/app/evolution/trainer.py`).
