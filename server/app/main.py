@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 
 from fastapi import FastAPI
 
@@ -21,12 +22,22 @@ from .routers import admin, blobs, device
 log = logging.getLogger(__name__)
 
 
+def normalize_pem(value: str) -> bytes:
+    """Rebuilds a PEM that went through a dashboard field: line breaks kept, written
+    as literal "\\n", turned into spaces, or stripped entirely."""
+    v = value.strip().replace("\\n", "\n").replace("\r\n", "\n")
+    m = re.fullmatch(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", v, re.S)
+    if not m:
+        return v.encode()
+    body = re.sub(r"\s+", "", m.group(2))
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    label = m.group(1)
+    return f"-----BEGIN {label}-----\n{chr(10).join(lines)}\n-----END {label}-----\n".encode()
+
+
 def make_signer(s: Settings) -> ManifestSigner:
     if s.ota_signing_key_pem:
-        pem = s.ota_signing_key_pem.get_secret_value().strip()
-        if "\n" not in pem:          # pasted into a dashboard as one line with literal "\n"
-            pem = pem.replace("\\n", "\n")
-        return ManifestSigner.from_pem(pem.encode() + b"\n")
+        return ManifestSigner.from_pem(normalize_pem(s.ota_signing_key_pem.get_secret_value()))
     if s.ota_signing_key_path:
         return ManifestSigner.from_pem(s.ota_signing_key_path.read_bytes())
     if s.dev_mode:

@@ -15,12 +15,14 @@ def _settings(**kw) -> Settings:
                     admin_token=SecretStr("strong-token"), **kw)
 
 
-@pytest.mark.parametrize("variant", ["multiline", "escaped_one_line", "crlf"])
+@pytest.mark.parametrize("variant", ["multiline", "escaped_one_line", "crlf", "newlines_stripped", "newlines_as_spaces"])
 def test_ota_key_from_env_in_any_paste_form(variant):
     signer = ManifestSigner.generate()
     pem = signer.private_pem().decode()
     value = {"multiline": pem, "escaped_one_line": pem.strip().replace("\n", "\\n"),
-             "crlf": pem.replace("\n", "\r\n")}[variant]
+             "crlf": pem.replace("\n", "\r\n"),
+             "newlines_stripped": pem.replace("\n", ""),          # single-line browser input
+             "newlines_as_spaces": pem.strip().replace("\n", " ")}[variant]
     loaded = make_signer(_settings(ota_signing_key_pem=SecretStr(value)))
     assert loaded.public_pem() == signer.public_pem()
 
