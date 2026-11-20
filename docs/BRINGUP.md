@@ -11,7 +11,7 @@ Bring the system up one layer at a time. Each step has a check that must pass be
 | 5 | + USB-UART adapter | auto-baud, IDENTIFY, bus upgrade, actions, ring log |
 | 6 | + Wi-Fi | telemetry into Supabase |
 | 7 | all of the above | evolution → OTA delta → trial → commit/rollback |
-| 8 | Render (free) + GitHub Actions | production deployment at no cost |
+| 8 | Supabase Edge Function + GitHub Actions | production deployment at no cost |
 
 ---
 
@@ -135,12 +135,17 @@ Then run `/ota` on the device console, or wait 5 minutes.
 - **Server-side:** `POST /api/v1/admin/models/1/activate`, and devices converge back to v1.
 - **Device-side:** a model that fails its self-test, or reboots 3 times before committing, is rolled back automatically.
 
-## 8. Deploy for free (Render + GitHub Actions)
+## 8. Deploy for free (Supabase Edge Function + GitHub Actions)
 
-**API on Render (free web service):**
-1. **New → Blueprint** and select the repo. `render.yaml` creates one service, `lisa-api`, on the free plan.
-2. Fill the `lisa` env group: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `OTA_SIGNING_KEY_PEM` (the full contents of `server/secrets/ota_signing_key.pem`). `ADMIN_TOKEN` is generated.
-3. **Check:** `https://<api>.onrender.com/healthz` returns `"ai": "LISA"`, `"dev_mode": false`, `"active_model": 1`.
+**API as a Supabase Edge Function** (free, always on, same host and TLS chain as model downloads):
+1. Supabase dashboard → **Edge Functions → Deploy a new function → Via Editor**.
+2. Name it **`lisa-api`**, paste the contents of `supabase/functions/lisa-api/index.ts`, and click **Deploy**. (CLI alternative: `supabase functions deploy lisa-api --no-verify-jwt`.)
+3. In the function's settings, turn **off** JWT verification ("Enforce JWT verification" / "Verify JWT"). Boards authenticate with their own node key, not a Supabase JWT.
+4. Optional, for the admin routes: **Edge Functions → Secrets** → add `ADMIN_TOKEN`. `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically.
+5. **Check:** `https://<project-ref>.supabase.co/functions/v1/lisa-api/healthz` returns `"ai": "LISA"`, `"active_model": 1`.
+6. Set `EDGE_SERVER_BASE_URL` in `edge/secrets.h` to `https://<project-ref>.supabase.co/functions/v1/lisa-api`.
+
+**Alternative: the Python API on Render.** `render.yaml` deploys the same API as a free web service. Free Render hours are shared across a workspace and can run out mid-month, which suspends the service.
 
 **Training on GitHub Actions (free for public repos):**
 1. In the GitHub repo: **Settings → Secrets and variables → Actions → New repository secret**. Add `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `OTA_SIGNING_KEY_PEM`, with the same values as on Render.

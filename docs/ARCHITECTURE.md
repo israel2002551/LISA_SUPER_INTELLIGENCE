@@ -3,8 +3,8 @@
 Three parts form one learning loop:
 
 ```
- ┌──────────── ESP32-S3 edge node (edge/) ────────────┐        ┌──── Render, free plan (server/) ──┐
- │ Core 1  inference_task   Gemma INT16 in PSRAM       │ HTTPS  │ lisa-api (FastAPI)                │
+ ┌──────────── ESP32-S3 edge node (edge/) ────────────┐        ┌── Supabase Edge Function ─────────┐
+ │ Core 1  inference_task   Gemma INT16 in PSRAM       │ HTTPS  │ lisa-api (or the FastAPI server)  │
  │ Core 0  uart_task        auto-baud, IDENTIFY,       │───────►│  POST /telemetry   GET /ota/check │
  │                          bus upgrade, actions       │◄───────│  POST /uart/classify  admin/*     │
  │         ring_task        logs -> W25Q Partition C   │        ├── GitHub Actions (or your PC) ────┤
@@ -50,6 +50,9 @@ gemma4/
 supabase/migrations/
   20261120000100_core_schema.sql    tables, indexes, FKs, RLS, activate_model_version()
   20261120000200_storage_buckets.sql models + deltas buckets
+  20261120000300_service_role_grants.sql  table privileges for service_role only
+supabase/functions/lisa-api/index.ts    the device API as an Edge Function (TypeScript port of
+                                        server/app/routers/device.py + ingest.py + uart_analysis.py)
 server/                        Render service
   app/main.py                  app factory (Supabase or in-memory dev mode)
   app/config.py                settings (env vars)
@@ -202,5 +205,6 @@ It also helps `/uart/classify` when the heuristics aren't confident.
 - **Speed:** the model is tiny (2.75M parameters), and a compact JSON action is ~35 tokens, each a full forward pass on the device. A shorter action syntax would cut that by ~3×.
 - **Fast links:** ESP-NOW/TCP/SPI bus upgrades are a hook, not an implementation.
 - **Worker:** run one worker only; runs aren't locked. The GitHub Actions workflow enforces this with a `concurrency` group; don't also run `worker.py` on your PC at the same time.
-- **Free Render plan:** the API sleeps after 15 minutes without traffic. An online device keeps it awake; after a sleep the first request takes up to about a minute, and the device retries from its ring log.
+- **Two API implementations:** the Edge Function (production, free, always on) and the Python server (local dev, tests, and the Render fallback). They must stay in step. When an endpoint changes, change both and run the edge-function test against both.
+- **Free Render plan (fallback only):** it sleeps after 15 minutes without traffic, and its free hours are shared across the workspace and can run out mid-month.
 - **TLS:** the device needs the root CA PEMs for your Render and Supabase hosts in `secrets.h` (see `BRINGUP.md`).
