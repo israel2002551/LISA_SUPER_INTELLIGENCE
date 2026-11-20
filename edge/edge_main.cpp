@@ -34,6 +34,7 @@ static QueueHandle_t g_result_q = nullptr;
 static uint32_t g_boot_count = 0;
 static int g_loaded_slot = -1;
 static bool g_storage_ok = false;
+static TaskHandle_t g_task_infer = nullptr, g_task_uart = nullptr, g_task_ring = nullptr, g_task_net = nullptr;
 
 // ==============================================================================
 // Tasks
@@ -127,6 +128,12 @@ static void print_status() {
     u["link"] = p.link;
     u["format"] = p.format;
     u["commands"] = p.n_accepts;
+    JsonObject st = d["stack_free_bytes"].to<JsonObject>();   // lowest free stack seen per task
+    const struct { const char* name; TaskHandle_t h; } tasks[] = {
+        {"infer", g_task_infer}, {"uart", g_task_uart}, {"ring", g_task_ring}, {"net", g_task_net}};
+    for (const auto& t : tasks) {
+        if (t.h) st[t.name] = uxTaskGetStackHighWaterMark(t.h);
+    }
     serializeJsonPretty(d, Serial);
     Serial.println();
 }
@@ -245,12 +252,13 @@ void setup() {
     g_net.begin(&g_slots, &g_ring, &g_link, &g_infer, &g_prefs);
 
     if (g_storage_ok) {
-        xTaskCreatePinnedToCore(ring_task, "ring", 4096, nullptr, EDGE_RING_TASK_PRIORITY, nullptr, 0);
+        xTaskCreatePinnedToCore(ring_task, "ring", 4096, nullptr, EDGE_RING_TASK_PRIORITY, &g_task_ring, 0);
         log_boot();
     }
-    xTaskCreatePinnedToCore(inference_task, "infer", 8192, nullptr, EDGE_INFER_TASK_PRIORITY, nullptr, 1);
-    xTaskCreatePinnedToCore(uart_task, "uart", 6144, nullptr, EDGE_UART_TASK_PRIORITY, nullptr, 0);
-    if (g_storage_ok) xTaskCreatePinnedToCore(net_task, "net", 12288, nullptr, EDGE_NET_TASK_PRIORITY, nullptr, 0);
+    xTaskCreatePinnedToCore(inference_task, "infer", 8192, nullptr, EDGE_INFER_TASK_PRIORITY, &g_task_infer, 1);
+    xTaskCreatePinnedToCore(uart_task, "uart", 12288, nullptr, EDGE_UART_TASK_PRIORITY, &g_task_uart, 0);
+    // TLS handshakes (P-384 chains) run on the net task's stack.
+    if (g_storage_ok) xTaskCreatePinnedToCore(net_task, "net", 16384, nullptr, EDGE_NET_TASK_PRIORITY, &g_task_net, 0);
 
     Serial.printf("[Init] Boot #%u ready. PSRAM free %u KB. Type /help.\n", (unsigned)g_boot_count,
                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));

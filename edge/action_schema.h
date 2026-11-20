@@ -50,6 +50,13 @@ struct DeviceProfile {
 
 enum ActionVerdict { ACTION_OK, ACTION_NOP, ACTION_INVALID };
 
+// A shared blank profile. DeviceProfile is ~2.7 KB; resetting with
+// `p = DeviceProfile()` would build that temporary on a small task stack.
+static const DeviceProfile& empty_profile() {
+    static const DeviceProfile empty{};
+    return empty;
+}
+
 // ---- Manifest -------------------------------------------------------------------
 // {"id":"thermo-01","type":"thermostat","fw":"1.0","emits":["temp"],
 //  "accepts":[{"cmd":"set_fan","args":{"level":"int:0..3"}}],
@@ -60,7 +67,7 @@ static bool profile_from_manifest(const char* line, uint32_t baud, DeviceProfile
     const char* id = doc["id"] | "";
     if (!*id) return false;
 
-    p = DeviceProfile();
+    p = empty_profile();
     p.present = true;
     p.identified = true;
     p.baud = baud;

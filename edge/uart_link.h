@@ -237,6 +237,10 @@ private:
 
     char line_[512];
     size_t line_len_ = 0;
+    DeviceProfile scratch_;          // working copy during discovery / re-identification
+    char scratch_line_[512];
+    uint8_t sample_[256];
+    uint8_t best_sample_[256];
     uint8_t raw_[256];
     size_t raw_len_ = 0;
     uint32_t raw_last_byte_ms_ = 0;
@@ -293,8 +297,9 @@ private:
         stats_.discoveries++;
         abort_inflight("link reset");
         state_ = LINK_DISCOVER;
-        DeviceProfile p;
-        char line[512];
+        // Big buffers are members, not locals: the UART task's stack is small.
+        DeviceProfile& p = scratch_;
+        char* line = scratch_line_;
 
         // 1. Active handshake: IDENTIFY at each candidate baud rate
         char ident[128];
@@ -305,7 +310,7 @@ private:
             send_line(ident);
             uint32_t t0 = millis();
             while (millis() - t0 < EDGE_HANDSHAKE_TIMEOUT_MS) {
-                if (read_line(line, sizeof(line), EDGE_HANDSHAKE_TIMEOUT_MS - (millis() - t0)) &&
+                if (read_line(line, sizeof(scratch_line_), EDGE_HANDSHAKE_TIMEOUT_MS - (millis() - t0)) &&
                     profile_from_manifest(line, baud, p)) {
                     on_identified(p);
                     return;
@@ -316,29 +321,27 @@ private:
         // 2. Passive: listen at each baud and score what arrives
         float best = 0.0f;
         uint32_t best_baud = 0;
-        uint8_t best_sample[256];
         size_t best_n = 0;
         for (uint32_t baud : kEdgeBaudCandidates) {
             set_baud(baud);
             frame_errors_ = 0;
-            uint8_t sample[256];
-            size_t n = listen(EDGE_PASSIVE_LISTEN_MS, sample, sizeof(sample));
-            float s = score_sample(sample, n, frame_errors_);
+            size_t n = listen(EDGE_PASSIVE_LISTEN_MS, sample_, sizeof(sample_));
+            float s = score_sample(sample_, n, frame_errors_);
             if (s > best) {
                 best = s;
                 best_baud = baud;
-                memcpy(best_sample, sample, n);
+                memcpy(best_sample_, sample_, n);
                 best_n = n;
             }
         }
         if (best > 0.4f) {
-            on_raw(best_baud, best_sample, best_n);
+            on_raw(best_baud, best_sample_, best_n);
             return;
         }
 
         if (state_ != LINK_NO_DEVICE) Serial.printf("[UART%u] No device found; retrying every %u s.\n", port_no_, EDGE_NO_DEVICE_RETRY_MS / 1000);
         xSemaphoreTake(mutex_, portMAX_DELAY);
-        profile_ = DeviceProfile();
+        profile_ = empty_profile();
         xSemaphoreGive(mutex_);
         state_ = LINK_NO_DEVICE;
         last_attempt_ms_ = millis();
@@ -369,7 +372,8 @@ private:
     }
 
     void on_raw(uint32_t baud, const uint8_t* sample, size_t n) {
-        DeviceProfile p;
+        DeviceProfile& p = scratch_;
+        p = empty_profile();
         p.present = true;
         p.identified = false;
         p.baud = baud;
@@ -513,7 +517,7 @@ private:
                 return;
             }
             if (!d["id"].isNull() && !d["accepts"].isNull()) {   // the device re-introduced itself
-                DeviceProfile p;
+                DeviceProfile& p = scratch_;
                 if (profile_from_manifest(line, profile_.baud, p)) {
                     strlcpy(p.link, profile_.link, sizeof(p.link));
                     xSemaphoreTake(mutex_, portMAX_DELAY);
