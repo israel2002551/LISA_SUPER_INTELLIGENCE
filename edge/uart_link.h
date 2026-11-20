@@ -233,6 +233,7 @@ private:
     uint32_t ping_nonce_ = 0, ping_deadline_ms_ = 0;
     uint8_t missed_pings_ = 0;
     bool classify_pending_ = false;
+    bool no_device_reported_ = false;   // print "No device found" once, not every retry
     ClassifyRequest classify_req_{};
 
     char line_[512];
@@ -339,7 +340,10 @@ private:
             return;
         }
 
-        if (state_ != LINK_NO_DEVICE) Serial.printf("[UART%u] No device found; retrying every %u s.\n", port_no_, EDGE_NO_DEVICE_RETRY_MS / 1000);
+        if (!no_device_reported_) {
+            Serial.printf("[UART%u] No device found; retrying every %u s.\n", port_no_, EDGE_NO_DEVICE_RETRY_MS / 1000);
+            no_device_reported_ = true;
+        }
         xSemaphoreTake(mutex_, portMAX_DELAY);
         profile_ = empty_profile();
         xSemaphoreGive(mutex_);
@@ -348,6 +352,7 @@ private:
     }
 
     void on_identified(DeviceProfile& p) {
+        no_device_reported_ = false;
         uint32_t from = p.baud;
         const char* upgrade = try_upgrade(p);
         xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -372,6 +377,7 @@ private:
     }
 
     void on_raw(uint32_t baud, const uint8_t* sample, size_t n) {
+        no_device_reported_ = false;
         DeviceProfile& p = scratch_;
         p = empty_profile();
         p.present = true;

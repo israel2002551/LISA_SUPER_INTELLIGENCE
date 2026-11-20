@@ -81,28 +81,54 @@ private:
     uint32_t cursor_ = 1;   // first ring seq not yet acknowledged by the server
     uint32_t last_upload_ms_ = 0, last_ota_ms_ = 0, last_wifi_attempt_ms_ = 0;
     bool wifi_started_ = false;
+    bool wifi_up_ = false;
     bool time_started_ = false;
     volatile bool force_ota_check_ = false;
 
     // ---- Wi-Fi ----
+    static const char* wifi_reason(wl_status_t s) {
+        switch (s) {
+            case WL_NO_SSID_AVAIL: return "network not found (hotspot off, out of range, or 5 GHz only)";
+            case WL_CONNECT_FAILED: return "connection refused (wrong password, or the device is blocked)";
+            case WL_CONNECTION_LOST: return "connection lost";
+            case WL_DISCONNECTED: return "still trying";
+            case WL_IDLE_STATUS: return "idle";
+            default: return "unknown";
+        }
+    }
+
     bool ensure_wifi() {
-        if (WiFi.status() == WL_CONNECTED) {
+        wl_status_t st = WiFi.status();
+        if (st == WL_CONNECTED) {
+            if (!wifi_up_) {
+                wifi_up_ = true;
+                Serial.printf("[Net] Wi-Fi connected, IP %s, RSSI %d dBm.\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            }
             if (!time_started_) {
                 // Real time for TLS certificate checks (if the SDK enables them) and logs.
                 configTime(0, 0, "pool.ntp.org", "time.google.com");
                 time_started_ = true;
-                Serial.printf("[Net] Wi-Fi connected, IP %s, RSSI %d dBm.\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
             }
             return true;
         }
-        if (!wifi_started_ || millis() - last_wifi_attempt_ms_ > EDGE_WIFI_RETRY_MS) {
-            if (!wifi_started_) {
-                WiFi.mode(WIFI_STA);
-                WiFi.setAutoReconnect(true);
-                Serial.printf("[Net] Connecting to Wi-Fi '%s'...\n", EDGE_WIFI_SSID);
-            }
+        if (wifi_up_) {
+            wifi_up_ = false;
+            Serial.printf("[Net] Wi-Fi lost (%s); reconnecting.\n", wifi_reason(st));
+        }
+        if (!wifi_started_) {
+            WiFi.mode(WIFI_STA);
+            WiFi.setAutoReconnect(true);
+            Serial.printf("[Net] Connecting to Wi-Fi '%s'...\n", EDGE_WIFI_SSID);
             WiFi.begin(EDGE_WIFI_SSID, EDGE_WIFI_PASSWORD);
             wifi_started_ = true;
+            last_wifi_attempt_ms_ = millis();
+        } else if (millis() - last_wifi_attempt_ms_ > EDGE_WIFI_RETRY_MS) {
+            // Give each attempt the full retry window: calling begin() again while a
+            // connection is still in progress aborts it.
+            Serial.printf("[Net] Wi-Fi not connected after %u s: %s. Retrying.\n", EDGE_WIFI_RETRY_MS / 1000,
+                          wifi_reason(st));
+            WiFi.disconnect();
+            WiFi.begin(EDGE_WIFI_SSID, EDGE_WIFI_PASSWORD);
             last_wifi_attempt_ms_ = millis();
         }
         return false;

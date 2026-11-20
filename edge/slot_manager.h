@@ -245,7 +245,9 @@ public:
             o["state"] = slot_state_name(ctl.slot[s].state);
             o["version"] = ctl.slot[s].version;
             o["size"] = ctl.slot[s].size;
-            o["sha256"] = ctl.slot[s].state == SLOT_EMPTY ? "" : hex;
+            // String() forces a copy: ArduinoJson keeps a bare const char* by pointer,
+            // and `hex` is reused on the next loop pass.
+            o["sha256"] = String(ctl.slot[s].state == SLOT_EMPTY ? "" : hex);
         }
     }
 
