@@ -21,6 +21,13 @@ def telemetry(client, headers, events, sha="", version=0, devices=None):
         "devices": devices or [], "events": events})
 
 
+def test_root_and_health(client):
+    assert client.get("/").json()["name"] == "LISA Evolution Server"
+    assert client.head("/").status_code == 200          # hosting health probes use HEAD /
+    h = client.get("/healthz").json()
+    assert h["ok"] and h["ai"] == "LISA"
+
+
 def test_auth(client):
     headers = register(client)
     assert client.post("/api/v1/telemetry", json={"node_id": "edge-01"}).status_code == 401

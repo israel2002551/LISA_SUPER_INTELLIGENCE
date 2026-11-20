@@ -81,11 +81,20 @@ private:
     uint32_t cursor_ = 1;   // first ring seq not yet acknowledged by the server
     uint32_t last_upload_ms_ = 0, last_ota_ms_ = 0, last_wifi_attempt_ms_ = 0;
     bool wifi_started_ = false;
+    bool time_started_ = false;
     volatile bool force_ota_check_ = false;
 
     // ---- Wi-Fi ----
     bool ensure_wifi() {
-        if (WiFi.status() == WL_CONNECTED) return true;
+        if (WiFi.status() == WL_CONNECTED) {
+            if (!time_started_) {
+                // Real time for TLS certificate checks (if the SDK enables them) and logs.
+                configTime(0, 0, "pool.ntp.org", "time.google.com");
+                time_started_ = true;
+                Serial.printf("[Net] Wi-Fi connected, IP %s, RSSI %d dBm.\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            }
+            return true;
+        }
         if (!wifi_started_ || millis() - last_wifi_attempt_ms_ > EDGE_WIFI_RETRY_MS) {
             if (!wifi_started_) {
                 WiFi.mode(WIFI_STA);

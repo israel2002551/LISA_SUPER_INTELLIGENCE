@@ -68,6 +68,10 @@ def create_app(ctx: EvolutionContext | None = None) -> FastAPI:
     if app.state.ctx.settings.dev_mode:
         app.include_router(blobs.router, prefix="/api/v1")
 
+    @app.api_route("/", methods=["GET", "HEAD"], tags=["ops"])
+    def root() -> dict:
+        return {"name": f"{name} Evolution Server", "status": "running", "health": "/healthz", "api_docs": "/docs"}
+
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict:
         c = app.state.ctx
