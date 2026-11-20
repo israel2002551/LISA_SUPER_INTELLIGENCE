@@ -1,0 +1,11 @@
+# Secrets
+edge/secrets.h
+server/.env
+*.pem
+
+# Build / cache output
+.pio/
+__pycache__/
+.pytest_cache/
+server/.data/
+server/secrets/

@@ -1,0 +1,209 @@
+#pragma once
+// ==============================================================================
+// Device profiles, prompt format, and action validation
+// ==============================================================================
+// SAFETY: the model never writes to hardware directly. Its output must be "NOP"
+// or a JSON action naming a command the peripheral declared in its IDENTIFY
+// manifest, with every argument matching the declared spec. Anything else is
+// logged as invalid_output (training signal for the server) and nothing is sent.
+//
+// Arg specs (same grammar in server/app/evolution/action_schema.py):
+//   "int" | "int:MIN..MAX" | "float" | "float:MIN..MAX" | "bool"
+//   "str" | "str:MAXLEN"   | "enum:a|b|c"
+// ==============================================================================
+
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <stdlib.h>
+#include "edge_config.h"
+
+#define EDGE_MAX_COMMANDS 8
+#define EDGE_MAX_ARGS     4
+
+struct ArgSpec {
+    char name[16];
+    char spec[40];
+};
+
+struct CommandSpec {
+    char cmd[24];
+    ArgSpec args[EDGE_MAX_ARGS];
+    uint8_t n_args;
+};
+
+struct DeviceProfile {
+    bool present = false;          // something is talking on the port
+    bool identified = false;       // answered IDENTIFY with a manifest
+    bool manifest_truncated = false;
+    char key[40] = "";             // manifest id, or "raw:uart1" for unidentified devices
+    char type[24] = "";            // manifest type, or cloud-classified intent
+    char format[16] = "unknown";   // json_lines | nmea | ascii_lines | csv | modbus_rtu | binary | unknown
+    char link[12] = "uart";        // uart | uart_fast | espnow | tcp | spi
+    uint32_t baud = 0;
+    uint32_t max_baud = 0;
+    bool acks_actions = true;      // peripheral replies {"ack":<id>,"ok":bool}
+    char links[48] = "";           // manifest bus.links, comma-separated
+    CommandSpec accepts[EDGE_MAX_COMMANDS];
+    uint8_t n_accepts = 0;
+    char manifest[512] = "";       // raw manifest JSON for telemetry
+};
+
+enum ActionVerdict { ACTION_OK, ACTION_NOP, ACTION_INVALID };
+
+// ---- Manifest -------------------------------------------------------------------
+// {"id":"thermo-01","type":"thermostat","fw":"1.0","emits":["temp"],
+//  "accepts":[{"cmd":"set_fan","args":{"level":"int:0..3"}}],
+//  "needs":["alerts"],"acks":true,"bus":{"max_baud":2000000,"links":["uart"]}}
+static bool profile_from_manifest(const char* line, uint32_t baud, DeviceProfile& p) {
+    JsonDocument doc;
+    if (deserializeJson(doc, line) != DeserializationError::Ok) return false;
+    const char* id = doc["id"] | "";
+    if (!*id) return false;
+
+    p = DeviceProfile();
+    p.present = true;
+    p.identified = true;
+    p.baud = baud;
+    strlcpy(p.key, id, sizeof(p.key));
+    strlcpy(p.type, doc["type"] | "device", sizeof(p.type));
+    strlcpy(p.format, "json_lines", sizeof(p.format));
+    p.max_baud = doc["bus"]["max_baud"] | 0;
+    p.acks_actions = doc["acks"] | true;
+
+    for (JsonVariantConst l : doc["bus"]["links"].as<JsonArrayConst>()) {
+        const char* name = l | "";
+        if (strlen(p.links) + strlen(name) + 2 < sizeof(p.links)) {
+            if (p.links[0]) strcat(p.links, ",");
+            strcat(p.links, name);
+        }
+    }
+
+    for (JsonObjectConst c : doc["accepts"].as<JsonArrayConst>()) {
+        if (p.n_accepts >= EDGE_MAX_COMMANDS) break;
+        CommandSpec& cs = p.accepts[p.n_accepts];
+        strlcpy(cs.cmd, c["cmd"] | "", sizeof(cs.cmd));
+        if (!cs.cmd[0]) continue;
+        cs.n_args = 0;
+        for (JsonPairConst kv : c["args"].as<JsonObjectConst>()) {
+            if (cs.n_args >= EDGE_MAX_ARGS) break;
+            strlcpy(cs.args[cs.n_args].name, kv.key().c_str(), sizeof(cs.args[0].name));
+            strlcpy(cs.args[cs.n_args].spec, kv.value() | "str", sizeof(cs.args[0].spec));
+            cs.n_args++;
+        }
+        p.n_accepts++;
+    }
+
+    size_t len = strlen(line);
+    p.manifest_truncated = len >= sizeof(p.manifest);
+    strlcpy(p.manifest, line, sizeof(p.manifest));
+    return true;
+}
+
+// ---- Prompt (contract with server/app/evolution/prompt_format.py) ----------------
+static int edge_build_prompt(const DeviceProfile& p, const char* event, char* out, size_t out_len) {
+    char ev[EDGE_EVENT_MAX_CHARS + 1];
+    size_t n = 0;
+    for (; event[n] && n < EDGE_EVENT_MAX_CHARS; n++) {
+        char c = event[n];
+        ev[n] = (c == '\r' || c == '\n') ? ' ' : c;
+    }
+    ev[n] = '\0';
+    return snprintf(out, out_len, "<d>%s:%s<e>%s<a>", p.key, p.type, ev);
+}
+
+// ---- Validation -------------------------------------------------------------------
+static bool parse_range(const char* s, double& lo, double& hi) {
+    char* end;
+    lo = strtod(s, &end);
+    if (end == s || end[0] != '.' || end[1] != '.') return false;
+    const char* s2 = end + 2;
+    hi = strtod(s2, &end);
+    return end != s2 && *end == '\0';
+}
+
+static bool arg_matches(const char* spec, JsonVariantConst v) {
+    const char* colon = strchr(spec, ':');
+    size_t kind_len = colon ? (size_t)(colon - spec) : strlen(spec);
+    const char* param = colon ? colon + 1 : nullptr;
+    auto kind_is = [&](const char* k) { return strlen(k) == kind_len && strncmp(spec, k, kind_len) == 0; };
+
+    if (kind_is("int")) {
+        if (!v.is<long>() || v.is<bool>()) return false;
+        if (!param) return true;
+        double lo, hi;
+        long x = v.as<long>();
+        return parse_range(param, lo, hi) && x >= lo && x <= hi;
+    }
+    if (kind_is("float")) {
+        if (!(v.is<float>() || v.is<long>()) || v.is<bool>()) return false;
+        if (!param) return true;
+        double lo, hi;
+        double x = v.as<double>();
+        return parse_range(param, lo, hi) && x >= lo && x <= hi;
+    }
+    if (kind_is("bool")) return v.is<bool>();
+    if (kind_is("str")) {
+        if (!v.is<const char*>()) return false;
+        return !param || strlen(v.as<const char*>()) <= (size_t)atoi(param);
+    }
+    if (kind_is("enum")) {
+        if (!v.is<const char*>() || !param) return false;
+        const char* val = v.as<const char*>();
+        size_t vl = strlen(val);
+        const char* p = param;
+        while (*p) {
+            const char* bar = strchr(p, '|');
+            size_t opt_len = bar ? (size_t)(bar - p) : strlen(p);
+            if (opt_len == vl && strncmp(p, val, vl) == 0) return true;
+            if (!bar) break;
+            p = bar + 1;
+        }
+        return false;
+    }
+    return false;   // unknown spec kind: reject
+}
+
+// Checks model output against the device's manifest. On ACTION_OK, `action`
+// holds {"cmd":...,"args":{...}}. `why` explains an ACTION_INVALID.
+static ActionVerdict validate_action(const DeviceProfile& p, const char* text, JsonDocument& action, char* why, size_t why_len) {
+    while (*text == ' ') text++;
+    if (strncmp(text, "NOP", 3) == 0) return ACTION_NOP;
+
+    action.clear();
+    if (deserializeJson(action, text) != DeserializationError::Ok || !action.is<JsonObject>()) {
+        snprintf(why, why_len, "not JSON");
+        return ACTION_INVALID;
+    }
+    const char* cmd = action["cmd"] | "";
+    const CommandSpec* cs = nullptr;
+    for (int i = 0; i < p.n_accepts; i++) {
+        if (strcmp(p.accepts[i].cmd, cmd) == 0) cs = &p.accepts[i];
+    }
+    if (!cs) {
+        snprintf(why, why_len, "unknown cmd '%s'", cmd);
+        return ACTION_INVALID;
+    }
+
+    JsonObjectConst args = action["args"].as<JsonObjectConst>();
+    for (JsonPairConst kv : args) {
+        const ArgSpec* as = nullptr;
+        for (int i = 0; i < cs->n_args; i++) {
+            if (strcmp(cs->args[i].name, kv.key().c_str()) == 0) as = &cs->args[i];
+        }
+        if (!as) {
+            snprintf(why, why_len, "unknown arg '%s'", kv.key().c_str());
+            return ACTION_INVALID;
+        }
+        if (!arg_matches(as->spec, kv.value())) {
+            snprintf(why, why_len, "arg '%s' violates %s", as->name, as->spec);
+            return ACTION_INVALID;
+        }
+    }
+    for (int i = 0; i < cs->n_args; i++) {
+        if (args.isNull() || args[cs->args[i].name].isNull()) {
+            snprintf(why, why_len, "missing arg '%s'", cs->args[i].name);
+            return ACTION_INVALID;
+        }
+    }
+    return ACTION_OK;
+}

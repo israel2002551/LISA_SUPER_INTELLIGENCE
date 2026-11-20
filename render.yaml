@@ -1,0 +1,58 @@
+# Render Blueprint: LISA evolution server for the self-evolving edge nodes.
+# New -> Blueprint -> pick this repo. Fill the env group values marked sync:false.
+#
+#   lisa-api     FastAPI: telemetry, OTA checks, UART classify, admin
+#   lisa-worker  runs evolution runs (curate -> train -> quantize -> publish)
+#
+# Both talk to Supabase; neither stores state locally. tokenizer.bin must be in
+# the repo root OR uploaded once with server/scripts/bootstrap_model.py.
+
+services:
+  - type: web
+    name: lisa-api
+    runtime: python
+    rootDir: server
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.2
+      - key: RUN_EVOLUTION_INLINE
+        value: "false"          # the worker trains; the API only queues runs
+      - fromGroup: lisa
+
+  - type: worker
+    name: lisa-worker
+    runtime: python
+    rootDir: server
+    plan: standard              # torch + training need more than 512 MB RAM
+    buildCommand: pip install -r requirements-train.txt
+    startCommand: python worker.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.2
+      - key: TRAINER
+        value: torch            # mock = dry-run the pipeline without ML; remote = external GPU hook
+      - fromGroup: lisa
+
+envVarGroups:
+  - name: lisa
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: OTA_SIGNING_KEY_PEM          # python server/scripts/gen_signing_key.py
+        sync: false
+      - key: TEACHER
+        value: rule                       # claude: also set ANTHROPIC_API_KEY
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: AUTO_ACTIVATE
+        value: "true"
+      - key: EVOLUTION_MIN_NEW_LOGS
+        value: "200"

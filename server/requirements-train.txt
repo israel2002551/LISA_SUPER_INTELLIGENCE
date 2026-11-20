@@ -1,0 +1,5 @@
+# Worker with real training (TRAINER=torch). CPU wheels: the edge model is ~2.75M
+# parameters, and the CUDA build of torch would add gigabytes for nothing.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
