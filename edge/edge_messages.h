@@ -1,12 +1,15 @@
 #pragma once
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
-// Messages between the UART task (Core 0) and the inference task (Core 1).
-// Fixed-size so they can travel through FreeRTOS queues by copy.
+// Messages between the UART task (Core 0) / USB console and the inference task
+// (Core 1). Fixed-size so they can travel through FreeRTOS queues by copy.
 
 struct InferRequest {
     uint32_t act_id;         // correlates request, result, peripheral ack and feedback
     uint32_t queued_ms;
+    QueueHandle_t reply_q;   // where the result goes; nullptr = the UART task's result queue
     char prompt[200];        // already in the prompt contract format (action_schema.h)
 };
 

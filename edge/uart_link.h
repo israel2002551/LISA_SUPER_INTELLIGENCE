@@ -558,7 +558,7 @@ private:
                 break;
             }
         }
-        InferRequest q;
+        InferRequest q{};   // reply_q = nullptr: results come back on the UART result queue
         q.act_id = next_act_id();
         q.queued_ms = millis();
         edge_build_prompt(profile_, line, q.prompt, sizeof(q.prompt));

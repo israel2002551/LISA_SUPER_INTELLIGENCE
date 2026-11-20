@@ -31,6 +31,7 @@ static InferenceWorker g_infer;
 static NetSync g_net;
 static QueueHandle_t g_infer_q = nullptr;
 static QueueHandle_t g_result_q = nullptr;
+static QueueHandle_t g_console_q = nullptr;   // replies to /ask and /sim
 static uint32_t g_boot_count = 0;
 static int g_loaded_slot = -1;
 static bool g_storage_ok = false;
@@ -46,7 +47,7 @@ static void inference_task(void*) {
     for (;;) {
         if (xQueueReceive(g_infer_q, &q, portMAX_DELAY) == pdTRUE) {
             g_infer.run(q, r);
-            xQueueSend(g_result_q, &r, portMAX_DELAY);
+            xQueueSend(q.reply_q ? q.reply_q : g_result_q, &r, portMAX_DELAY);
         }
     }
 }
@@ -177,8 +178,164 @@ static void provision_over_usb(const char* args) {
     ESP.restart();
 }
 
+// ==============================================================================
+// Talking to LISA from the USB console: /ask and /sim
+// ==============================================================================
+// Both go through the inference task's queue (the engine is single-task) with
+// their own reply queue, so they never collide with UART traffic.
+
+static bool console_infer(const char* prompt, uint32_t act_id, InferResult& r) {
+    if (!g_model.loaded) {
+        Serial.println("LISA has no model loaded (see /status).");
+        return false;
+    }
+    InferRequest q{};
+    q.act_id = act_id;
+    q.queued_ms = millis();
+    q.reply_q = g_console_q;
+    strlcpy(q.prompt, prompt, sizeof(q.prompt));
+    if (xQueueSend(g_infer_q, &q, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        Serial.println("LISA is busy with device events; try again.");
+        return false;
+    }
+    Serial.print("LISA is thinking");
+    for (int waited = 0; xQueueReceive(g_console_q, &r, pdMS_TO_TICKS(1000)) != pdTRUE; waited++) {
+        Serial.print(".");
+        if (waited > 120) {
+            Serial.println(" no answer after 2 minutes.");
+            return false;
+        }
+    }
+    Serial.println();
+    return true;
+}
+
+// /ask <text>: any text straight into LISA's model.
+static void ask_lisa(const char* text) {
+    InferResult r;
+    if (!console_infer(text, 0, r)) return;
+    Serial.printf("LISA: %s\n      [%u ms, model v%u]\n", r.output[0] ? r.output : "(no output)", (unsigned)r.latency_ms,
+                  (unsigned)r.model_version);
+}
+
+// A simulated smart thermostat (same manifest and policy as tools/fake_peripheral.py).
+// Its manifest carries the rules the server's teacher uses, so /sim events
+// become training data and LISA learns this device's behavior.
+static const char* kSimManifest =
+    "{\"id\":\"sim-thermo\",\"type\":\"thermostat\",\"fw\":\"sim\",\"emits\":[\"temp\",\"hum\"],"
+    "\"accepts\":[{\"cmd\":\"set_fan\",\"args\":{\"level\":\"int:0..3\"}},{\"cmd\":\"beep\",\"args\":{}}],"
+    "\"needs\":[\"alerts\"],\"acks\":true,"
+    "\"rules\":[{\"when\":{\"ev\":\"temp\",\"gt\":30},\"do\":{\"cmd\":\"set_fan\",\"args\":{\"level\":2}}},"
+    "{\"when\":{\"ev\":\"temp\",\"lt\":15},\"do\":{\"cmd\":\"set_fan\",\"args\":{\"level\":0}}}]}";
+static DeviceProfile g_sim;
+static bool g_sim_ready = false;
+static uint32_t g_sim_count = 0;
+
+static void sim_setup() {
+    if (g_sim_ready) return;
+    profile_from_manifest(kSimManifest, 115200, g_sim);
+    JsonDocument d;   // register the simulated device with the server (once per boot)
+    d["kind"] = "device";
+    d["dev"] = g_sim.key;
+    d["port"] = 0;
+    d["identified"] = true;
+    d["baud"] = 115200;
+    d["link"] = "uart";
+    d["format"] = "json_lines";
+    d["type"] = g_sim.type;
+    d["manifest"] = serialized(String(kSimManifest));
+    char buf[RING_MAX_PAYLOAD + 1];
+    if (serializeJson(d, buf, sizeof(buf)) < sizeof(buf)) g_ring.post(REC_DEVICE, buf);
+    g_sim_ready = true;
+}
+
+// Runs one temperature event through LISA. Returns true if she did the right thing.
+static bool sim_event(float temp, bool verbose) {
+    sim_setup();
+    char event[48], prompt[200];
+    snprintf(event, sizeof(event), "{\"ev\":\"temp\",\"v\":%.1f}", temp);
+    edge_build_prompt(g_sim, event, prompt, sizeof(prompt));
+    uint32_t act_id = 0x80000000u | ((g_boot_count & 0x7FF) << 20) | (++g_sim_count & 0xFFFFF);
+    InferResult r;
+    if (!console_infer(prompt, act_id, r)) return false;
+
+    // What the thermostat wants (its own policy, like a real smart peripheral).
+    int want = temp > 30 ? 2 : (temp < 15 ? 0 : -1);   // -1 = no action
+    JsonDocument action;
+    char why[64] = "";
+    ActionVerdict v = validate_action(g_sim, r.output, action, why, sizeof(why));
+    int got = (v == ACTION_OK && strcmp(action["cmd"] | "", "set_fan") == 0) ? (int)(action["args"]["level"] | -9) : -1;
+    bool correct = (v == ACTION_NOP && want == -1) || (v == ACTION_OK && got == want && want != -1);
+    const char* status = v == ACTION_NOP ? "nop" : (v == ACTION_INVALID ? "invalid_output" : "ok");
+
+    // Log it exactly like a real interaction (+ the thermostat's feedback on actions).
+    JsonDocument d;
+    d["kind"] = "interaction";
+    d["dev"] = g_sim.key;
+    d["act_id"] = act_id;
+    d["input"] = event;
+    d["prompt"] = prompt;
+    d["output"] = r.output;
+    if (v == ACTION_OK) {
+        char a[160];
+        serializeJson(action, a, sizeof(a));
+        d["action"] = serialized(String(a));
+    }
+    d["status"] = status;
+    if (why[0]) d["err"] = why;
+    d["lat"] = r.latency_ms;
+    d["mv"] = r.model_version;
+    char buf[RING_MAX_PAYLOAD + 1];
+    if (measureJson(d) > RING_MAX_PAYLOAD) d.remove("prompt");
+    if (serializeJson(d, buf, sizeof(buf)) < sizeof(buf)) g_ring.post(REC_INTERACTION, buf);
+    if (v == ACTION_OK) {
+        JsonDocument f;
+        f["kind"] = "feedback";
+        f["dev"] = g_sim.key;
+        f["ref_act_id"] = act_id;
+        f["value"] = correct ? "good" : "bad";
+        serializeJson(f, buf, sizeof(buf));
+        g_ring.post(REC_FEEDBACK, buf);
+    }
+
+    if (verbose) {
+        Serial.printf("Thermostat: %s\n", event);
+        Serial.printf("LISA:       %s\n", r.output[0] ? r.output : "(no output)");
+        const char* expect = want == 2 ? "set_fan level 2 (hot)" : want == 0 ? "set_fan level 0 (cold)" : "NOP (comfortable)";
+        Serial.printf("Verdict:    %s - wanted %s  [%u ms, model v%u]\n",
+                      correct ? "CORRECT" : (v == ACTION_INVALID ? "invalid answer" : "wrong action"), expect,
+                      (unsigned)r.latency_ms, (unsigned)r.model_version);
+        if (v == ACTION_INVALID) Serial.printf("            (%s; nothing was sent to hardware)\n", why);
+    }
+    return correct;
+}
+
+// /sim <temp> | /sim auto <n>
+static void simulate(const char* args) {
+    while (*args == ' ') args++;
+    if (strncmp(args, "auto", 4) == 0) {
+        int n = constrain(atoi(args + 4), 1, 100);
+        int correct = 0;
+        Serial.printf("Running %d random thermostat events through LISA...\n", n);
+        for (int i = 0; i < n; i++) {
+            float t = (esp_random() % 451) / 10.0f;   // 0.0 .. 45.0 C
+            bool ok = sim_event(t, false);
+            correct += ok;
+            Serial.printf("  %2d/%d  %4.1f C -> %s\n", i + 1, n, t, ok ? "correct" : "wrong");
+        }
+        Serial.printf("LISA got %d/%d right. These events are logged and will upload for training.\n", correct, n);
+    } else if (*args) {
+        sim_event(atof(args), true);
+    } else {
+        Serial.println("Usage: /sim <temperature>   e.g. /sim 33     or   /sim auto 20");
+    }
+}
+
 static void print_help() {
-    Serial.println("\n--- Edge node console ---");
+    Serial.println("\n--- LISA console ---");
+    Serial.println(" /ask <text>         Send any text to LISA's model and show her answer");
+    Serial.println(" /sim <temp>         Simulate a thermostat event; LISA decides, the thermostat judges");
+    Serial.println(" /sim auto <n>       n random thermostat events (training data for LISA)");
     Serial.println(" /status             Model, slots, ring log, UART link, Wi-Fi");
     Serial.println(" /ring [n]           Print the last n ring-log records (default 10)");
     Serial.println(" /rediscover         Re-run UART auto-baud + IDENTIFY");
@@ -190,6 +347,8 @@ static void print_help() {
 
 static void handle_command(const char* cmd) {
     if (strcmp(cmd, "/help") == 0) print_help();
+    else if (strncmp(cmd, "/ask ", 5) == 0) ask_lisa(cmd + 5);
+    else if (strncmp(cmd, "/sim", 4) == 0) simulate(cmd + 4);
     else if (strcmp(cmd, "/status") == 0) print_status();
     else if (strncmp(cmd, "/ring", 5) == 0) print_ring(cmd[5] ? max(1, atoi(cmd + 6)) : 10);
     else if (strcmp(cmd, "/rediscover") == 0) g_link.request_rediscover();
@@ -248,6 +407,7 @@ void setup() {
 
     g_infer_q = xQueueCreate(4, sizeof(InferRequest));
     g_result_q = xQueueCreate(8, sizeof(InferResult));
+    g_console_q = xQueueCreate(1, sizeof(InferResult));
     g_link.begin(&g_ring, g_infer_q, g_result_q, g_boot_count);
     g_net.begin(&g_slots, &g_ring, &g_link, &g_infer, &g_prefs);
 
