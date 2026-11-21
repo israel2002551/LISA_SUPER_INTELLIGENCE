@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -48,6 +49,12 @@ class TrainConfig:
     freeze_embeddings: bool = True
     seed: int = 0
     eval_limit: int = 64          # val examples decoded for exact-match
+    # "cosine": linear warmup, then cosine decay to lr * min_lr_ratio. With a constant LR the
+    # final weights sit wherever the last noisy step left them; on character-level JSON that
+    # garbles the output (seen as '{"cmd":"set_fan",","an":...' after 1200 steps at 3e-3).
+    schedule: str = "constant"    # constant | cosine
+    warmup_steps: int = 0
+    min_lr_ratio: float = 0.05
 
 
 @dataclass
@@ -64,6 +71,17 @@ class Trainer(Protocol):
               cfg: TrainConfig) -> TrainResult: ...
 
 
+def lr_factor(step: int, cfg: TrainConfig) -> float:
+    """Multiplier on cfg.lr for optimizer step `step` (0-based)."""
+    if cfg.schedule == "constant":
+        return 1.0
+    if step < cfg.warmup_steps:
+        return (step + 1) / cfg.warmup_steps
+    span = max(1, cfg.steps - cfg.warmup_steps)
+    progress = min(1.0, (step - cfg.warmup_steps) / span)
+    return cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
 class MockTrainer:
     name = "mock"
 
@@ -73,6 +91,9 @@ class MockTrainer:
         w["final_norm"] = (w["final_norm"] + rng.standard_normal(w["final_norm"].shape).astype(np.float32) * 1e-3)
         info = {"mock": True, "n_train": len(train), "n_val": len(val)}
         return TrainResult(w, info, dict(info))
+
+    def evaluate_weights(self, weights, val, tok, cfg) -> dict[str, Any]:
+        return {"mock": True, "n_val": len(val)}
 
 
 class TorchTrainer:
@@ -101,6 +122,11 @@ class TorchTrainer:
         return {"n_val": len(val), "val_loss": float(np.mean(losses)), "exact_match": exact / len(subset),
                 "valid_action_rate": valid / len(subset)}
 
+    def evaluate_weights(self, weights: Weights, val: list[Example], tok: BpeTokenizer, cfg: TrainConfig) -> dict[str, Any]:
+        from .model import EdgeGemma
+
+        return self.evaluate(EdgeGemma(weights), val, tok, cfg)
+
     def train(self, base, train, val, tok, cfg) -> TrainResult:
         import torch
 
@@ -116,6 +142,7 @@ class TorchTrainer:
             model.params["embed"].requires_grad_(False)
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=0.0)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: lr_factor(step, cfg))
 
         usable = [ex for ex in train if target_fits(tok, ex.target)]
         if len(usable) < len(train):
@@ -147,6 +174,7 @@ class TorchTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
+            sched.step()
             loss_val = loss.detach().item()
             if step % 50 == 0:
                 log.info("train step %d/%d loss %.4f", step, cfg.steps, loss_val)

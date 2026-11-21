@@ -1,7 +1,7 @@
 """The self-improvement loop, one evolution run at a time.
 
   1. curate      interaction_logs -> scored training examples
-  2. synthesize  rule-boundary + safety (NOP) examples per device
+  2. synthesize  rule-boundary, full-range and safety (NOP) examples per device
   3. train       Trainer (mock | torch | remote) from the active model's weights
   4. gate        the candidate must beat its parent on the same val split
   5. quantize    INT16 image, checked against the W25Q slot + PSRAM budget
@@ -118,11 +118,17 @@ def _base_weights(ctx: EvolutionContext, parent: dict[str, Any] | None) -> tuple
 # ---------------------------------------------------------------------------
 # Gate
 # ---------------------------------------------------------------------------
-def gate(baseline: dict[str, Any], metrics: dict[str, Any], min_improvement: float, force: bool) -> tuple[bool, str]:
+def gate(baseline: dict[str, Any], metrics: dict[str, Any], min_improvement: float, force: bool,
+         min_val: int = 0) -> tuple[bool, str]:
     if force:
         return True, "forced"
     if metrics.get("mock"):
         return False, "mock trainer produces no real improvement; pass force_publish to publish anyway"
+    # A handful of examples can't tell a model that learned the rules from one that always
+    # gives the majority answer (on hardware, 4 examples let an "always NOP" model through).
+    n_val = metrics.get("n_val", baseline.get("n_val"))
+    if n_val is not None and n_val < min_val:
+        return False, f"only {n_val} validation examples (< {min_val}); too few to judge"
     b_em, c_em = baseline.get("exact_match"), metrics.get("exact_match")
     if c_em is None or b_em is None:
         return False, "no validation examples to compare on"
@@ -158,7 +164,7 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
         # 1-2. Curate + synthesize
         stats["curation"] = curate(repo, ctx.teacher, s.curate_batch)
         devices = [DeviceContext.from_row(d) for d in repo.list_uart_devices()]
-        synth_rows = synthesize(devices, s.synth_per_device, seed=len(repo.list_runs(1000)))
+        synth_rows = synthesize(devices, s.synth_per_device)   # stable per device: re-runs add nothing new
         stats["synthetic_inserted"] = repo.insert_examples(synth_rows)
 
         manifests = {d.key: d.manifest for d in devices}
@@ -173,19 +179,34 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
         if len(train) < s.min_train_examples and not force:
             return _finish(ctx, run_id, "rejected", stats, f"only {len(train)} training examples (< {s.min_train_examples})")
 
-        # 3. Train
+        # 3. Train. Normally from the active model; params.base_version restarts from an earlier
+        # one (e.g. when the active model has collapsed to always giving the same answer).
         parent = repo.get_active_model()
-        base, base_name = _base_weights(ctx, parent)
-        cfg = TrainConfig(steps=int(params.get("steps", s.train_steps)), batch_size=s.train_batch_size, lr=s.train_lr,
-                          method=params.get("method", s.train_method), lora_rank=s.lora_rank,
-                          freeze_embeddings=s.freeze_embeddings, seed=len(train))
+        start = parent
+        if params.get("base_version") is not None:
+            start = repo.get_model(int(params["base_version"]))
+            if start is None:
+                raise ValueError(f"unknown base_version {params['base_version']}")
+        base, base_name = _base_weights(ctx, start)
+        cfg = TrainConfig(steps=int(params.get("steps", s.train_steps)), batch_size=s.train_batch_size,
+                          lr=float(params.get("lr", s.train_lr)), method=params.get("method", s.train_method),
+                          lora_rank=s.lora_rank, freeze_embeddings=s.freeze_embeddings, seed=len(train),
+                          schedule=s.train_schedule, warmup_steps=s.train_warmup_steps)
         trainer = make_trainer(params.get("trainer") or s.trainer, s.remote_trainer_url,
                                s.remote_trainer_token.get_secret_value() if s.remote_trainer_token else None)
         result = trainer.train(base, train, val, ctx.tokenizer(), cfg)
-        stats.update(base=base_name, trainer=trainer.name, baseline=result.baseline, candidate=result.metrics)
+        baseline = result.baseline
+        if parent is not None and start is not parent:
+            # The gate compares with what devices run now, not with the restart point.
+            if not hasattr(trainer, "evaluate_weights"):
+                raise ValueError(f"base_version needs a trainer that can evaluate the active model ({trainer.name} can't)")
+            parent_weights, _ = _base_weights(ctx, parent)
+            baseline = trainer.evaluate_weights(parent_weights, val, ctx.tokenizer(), cfg)
+        stats.update(base=base_name, baseline_model=f"v{parent['version']}" if parent else base_name,
+                     trainer=trainer.name, baseline=baseline, candidate=result.metrics)
 
         # 4. Gate
-        ok, reason = gate(result.baseline, result.metrics, s.gate_min_improvement, force)
+        ok, reason = gate(baseline, result.metrics, s.gate_min_improvement, force, s.gate_min_val_examples)
         stats["gate"] = reason
         if not ok:
             return _finish(ctx, run_id, "rejected", stats, reason)

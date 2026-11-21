@@ -119,13 +119,23 @@ static int edge_build_prompt(const DeviceProfile& p, const char* event, char* ou
 }
 
 // ---- Validation -------------------------------------------------------------------
+// "LO..HI", e.g. "0..3", "-1.5..2.5". Split on ".." first: strtod("0..3") would
+// consume "0." as a number and leave ".3", so every integer range used to fail
+// (every action with a ranged arg was rejected as invalid).
 static bool parse_range(const char* s, double& lo, double& hi) {
+    const char* dots = strstr(s, "..");
+    if (!dots || dots == s) return false;
+    char first[24];
+    size_t n = (size_t)(dots - s);
+    if (n >= sizeof(first)) return false;
+    memcpy(first, s, n);
+    first[n] = '\0';
     char* end;
-    lo = strtod(s, &end);
-    if (end == s || end[0] != '.' || end[1] != '.') return false;
-    const char* s2 = end + 2;
-    hi = strtod(s2, &end);
-    return end != s2 && *end == '\0';
+    lo = strtod(first, &end);
+    if (end == first || *end != '\0') return false;
+    const char* second = dots + 2;
+    hi = strtod(second, &end);
+    return end != second && *end == '\0';
 }
 
 static bool arg_matches(const char* spec, JsonVariantConst v) {

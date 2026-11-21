@@ -58,6 +58,9 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="process the queue / policy, then exit (cron, CI)")
     parser.add_argument("--trigger", action="store_true", help="start a manual evolution run first")
     parser.add_argument("--force", action="store_true", help="with --trigger: publish even if the gate rejects")
+    parser.add_argument("--base-version", type=int, help="with --trigger: train from this model version instead of "
+                        "the active one (the gate still compares with the active one)")
+    parser.add_argument("--steps", type=int, help="with --trigger: training steps for this run")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
@@ -65,8 +68,10 @@ def main() -> None:
     if settings.dev_mode:
         log.warning("Worker in dev mode has its own in-memory database; it can't see the web service's data.")
     if args.trigger:
-        run = create_run(ctx, "manual", {"force_publish": True} if args.force else {})
-        log.info("created manual run %s%s", run["id"], " (force publish)" if args.force else "")
+        params = {k: v for k, v in {"force_publish": True if args.force else None, "base_version": args.base_version,
+                                    "steps": args.steps}.items() if v is not None}
+        run = create_run(ctx, "manual", params)
+        log.info("created manual run %s %s", run["id"], params or "")
     if args.once:
         for _ in range(MAX_STEPS_PER_ONCE):
             if not tick(ctx):

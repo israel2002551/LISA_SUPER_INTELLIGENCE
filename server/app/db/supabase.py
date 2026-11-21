@@ -5,8 +5,11 @@ Uses the service_role key, which bypasses RLS. Never ship this key to a device.
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -28,6 +31,24 @@ EXAMPLE_COLUMNS = (
 
 class SupabaseError(RuntimeError):
     pass
+
+
+log = logging.getLogger(__name__)
+T = TypeVar("T")
+RETRY_DELAYS_S = (2.0, 5.0, 15.0)   # model images are ~5.5 MB; a dropped connection mid-upload is common on mobile links
+
+
+def _with_retries(what: str, fn: Callable[[], T]) -> T:
+    """Retries transport failures (reset, timeout); HTTP error statuses are not retried."""
+    for delay in (*RETRY_DELAYS_S, None):
+        try:
+            return fn()
+        except httpx.TransportError as e:
+            if delay is None:
+                raise
+            log.warning("%s: %s: %s, retrying in %.0f s", what, type(e).__name__, e, delay)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _check(resp: httpx.Response) -> httpx.Response:
@@ -190,12 +211,14 @@ class SupabaseBlobStore:
     def _p(bucket: str, path: str) -> str:
         return f"{quote(bucket)}/{quote(path)}"
 
-    def put(self, bucket: str, path: str, data: bytes) -> None:
-        _check(self._http.post(f"{self._base}/object/{self._p(bucket, path)}", content=data,
-                               headers={"Content-Type": "application/octet-stream", "x-upsert": "true"}))
+    def put(self, bucket: str, path: str, data: bytes) -> None:   # x-upsert makes a retry after a partial upload safe
+        _check(_with_retries(f"upload {bucket}/{path}", lambda: self._http.post(
+            f"{self._base}/object/{self._p(bucket, path)}", content=data,
+            headers={"Content-Type": "application/octet-stream", "x-upsert": "true"})))
 
     def get(self, bucket: str, path: str) -> bytes:
-        resp = self._http.get(f"{self._base}/object/{self._p(bucket, path)}")
+        resp = _with_retries(f"download {bucket}/{path}",
+                             lambda: self._http.get(f"{self._base}/object/{self._p(bucket, path)}"))
         if resp.status_code in (400, 404):
             raise BlobNotFound(f"{bucket}/{path}")
         return _check(resp).content

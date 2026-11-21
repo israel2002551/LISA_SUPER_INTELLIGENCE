@@ -199,7 +199,22 @@ It also helps `/uart/classify` when the heuristics aren't confident.
 - The behavior survives INT16 quantization.
 - An end-to-end HTTP run (register → bootstrap → 226 simulated records → evolution) published a model the OTA path delivered as a verified delta.
 
-**Not measured:** anything on real hardware. Inference speed, Wi-Fi/TLS behavior, actual OTA timing and UART timing on the ESP32-S3 all need the bring-up in `BRINGUP.md`.
+**Measured on hardware (ESP32-S3 N16R8 + W25Q128, node `lisa-01`, simulated thermostat via `/sim`):**
+- **First full learning cycle:** v1 (random weights) scored 0/24 on random thermostat events between 0 and 45 °C. v3 scored 24/24, including 29.7, 30.8 and 14.1 °C, just inside each threshold. The steps were: board events → Supabase → CPU training → signed delta OTA → trial boot → commit.
+- **Training recipe:** 1200 steps at lr 1e-3 with warmup plus cosine decay, on 400 synthesized examples per device spread across the rules' whole range. Measured on held-out examples:
+
+  | Setup | Held-out exact match |
+  |---|---|
+  | This recipe | 0.97 (35 examples) |
+  | Constant lr 3e-3 | 0.00–0.34; garbled JSON |
+  | Cosine at 3e-3 | 0.57–0.66; memorizes |
+  | 68 examples clustered at the thresholds (v2) | "NOP" for everything |
+
+  The gate now needs at least 20 validation examples, because v2 passed on 4.
+- **Inference:** `NOP` takes about 4 s; a JSON action (~36 tokens) takes 8–11 s.
+- **OTA:** the v2→v3 delta was 3.4 MB of a 5.5 MB image. Erasing the 5.4 MB staging area took 14.8 s, longer than the 5 s task watchdog, so erase, patch and verify feed the watchdog from the net task (`edge/wdt_scope.h`). Model load from the W25Q into PSRAM takes 2.2 s.
+
+Not yet measured on hardware: a physical UART peripheral (only the simulator so far) and ESP-NOW/TCP links.
 
 **Limits:**
 - **Speed:** the model is tiny (2.75M parameters), and a compact JSON action is ~35 tokens, each a full forward pass on the device. A shorter action syntax would cut that by ~3×.

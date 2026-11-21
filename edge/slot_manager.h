@@ -23,6 +23,7 @@
 #include "sha256_util.h"
 #include "w25q_layout.h"
 #include "edge_config.h"
+#include "wdt_scope.h"
 
 enum SlotState : uint32_t {
     SLOT_EMPTY = 0,
@@ -176,10 +177,14 @@ public:
         }
         const uint32_t BLOCK = 0x10000;
         uint32_t len = (size + BLOCK - 1) & ~(BLOCK - 1);
+        uint32_t t0 = millis();
         for (uint32_t off = 0; off < len; off += BLOCK) {
             if (esp_flash_erase_region(g_w25, w25_slot_addr(s) + off, BLOCK) != ESP_OK) return false;
+            wdt_feed();      // one block erase is bounded by the driver's timeout (~1 s)
             vTaskDelay(1);   // let lower-priority Core 0 tasks run between 64 KiB erases
         }
+        Serial.printf("[Slots] Erased slot %c (%u KiB) in %u ms.\n", 'A' + s, (unsigned)(len / 1024),
+                      (unsigned)(millis() - t0));
         return true;
     }
 
@@ -201,6 +206,8 @@ public:
             uint32_t n = min((uint32_t)sizeof(buf), size - off);
             if (!read_slot(slot, off, buf, n)) return false;
             sha.update(buf, n);
+            wdt_feed();
+            if ((off / sizeof(buf)) % 16 == 15) vTaskDelay(1);   // let lower-priority Core 0 tasks run every 64 KiB
         }
         sha.finish(out);
         return true;

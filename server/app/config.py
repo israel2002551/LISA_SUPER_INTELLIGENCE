@@ -49,15 +49,20 @@ class Settings(BaseSettings):
     evolution_min_gap_s: int = 600                     # worker: never start runs closer together than this
     worker_poll_s: int = 30
     curate_batch: int = 5000
-    synth_per_device: int = 64
+    synth_per_device: int = 400                        # ~400 spread over the range: 0.00 -> 0.85 (tests/test_model.py)
     min_train_examples: int = 32
-    train_steps: int = 400                             # tests/test_model.py: 0.00 -> 0.85 exact match at these
+    # Measured on the real sim-thermo dataset (374 train / 35 val), 1200 steps from v1:
+    #   1e-3 cosine -> 0.97 exact match;  3e-3 cosine -> 0.57-0.66 (memorizes);  3e-3 constant -> 0.00-0.34
+    train_steps: int = 1200
     train_batch_size: int = 16
-    train_lr: float = 3e-3
+    train_lr: float = 1e-3
+    train_schedule: Literal["constant", "cosine"] = "cosine"
+    train_warmup_steps: int = 60
     train_method: Literal["full", "lora"] = "full"
     lora_rank: int = 8
     freeze_embeddings: bool = True                     # keeps OTA deltas ~2 MiB smaller
     gate_min_improvement: float = 0.0                  # exact-match gain needed to publish
+    gate_min_val_examples: int = 20                    # fewer can't separate learning from "always the majority answer"
     auto_activate: bool = True
     delta_max_ratio: float = 0.7                       # publish a delta only if it's this much smaller
 

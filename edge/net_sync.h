@@ -22,6 +22,7 @@
 #include "edge_config.h"
 #include "slot_manager.h"
 #include "ring_log.h"
+#include "wdt_scope.h"
 #include "uart_link.h"
 #include "inference_task.h"
 #include "ota_verify.h"
@@ -361,7 +362,7 @@ private:
         if (!slots_->try_lock_staging()) return false;
 
         log_ota("download", version, kind);
-        bool ok = slots_->erase_staging(size);
+        bool ok = with_flash_watchdog([&] { return slots_->erase_staging(size); });
         if (!ok) log_ota("failed", version, "erase failed");
 
         std::unique_ptr<WiFiClient> client = ok ? make_client(url) : nullptr;
@@ -380,12 +381,14 @@ private:
         }
         if (ok) {
             WiFiClient* s = http.getStreamPtr();
-            ok = strcmp(kind, "delta") == 0 ? apply_delta(http, s, size, sha) : copy_full(http, s, size);
+            ok = with_flash_watchdog([&] {
+                return strcmp(kind, "delta") == 0 ? apply_delta(http, s, size, sha) : copy_full(http, s, size);
+            });
             if (!ok) log_ota("failed", version, "transfer or patch failed");
         }
         http.end();
 
-        if (ok && !slots_->finalize_staging(version, size, sha, false)) {
+        if (ok && !with_flash_watchdog([&] { return slots_->finalize_staging(version, size, sha, false); })) {
             ok = false;
             log_ota("failed", version, "SHA-256 mismatch after write");
         }
@@ -397,6 +400,15 @@ private:
         return true;
     }
 
+    // Erase, patch and verify busy-wait on the W25Q for seconds; see wdt_scope.h. Not used
+    // around HTTP requests: a TLS handshake may legitimately block longer than the watchdog.
+    template <typename F>
+    static bool with_flash_watchdog(F&& work) {
+        OtaWatchdogScope wdt;
+        return work();
+    }
+
+    // Bounded by EDGE_HTTP_TIMEOUT_MS of silence; feeds the watchdog while it waits.
     static bool read_exact(HTTPClient& http, WiFiClient* s, uint8_t* buf, size_t n) {
         size_t got = 0;
         uint32_t last = millis();
@@ -410,6 +422,7 @@ private:
                 }
             } else {
                 if (!http.connected() || millis() - last > EDGE_HTTP_TIMEOUT_MS) return false;
+                wdt_feed();
                 delay(2);
             }
         }
@@ -422,6 +435,8 @@ private:
         for (uint32_t off = 0; off < size; off += sizeof(buf)) {
             uint32_t n = min((uint32_t)sizeof(buf), size - off);
             if (!read_exact(http, s, buf, n) || !slots_->write_staging(off, buf, n)) return false;
+            wdt_feed();
+            if ((off / sizeof(buf)) % 16 == 15) vTaskDelay(1);   // a fast link never empties the socket, so read_exact won't yield
         }
         return true;
     }
@@ -458,6 +473,10 @@ private:
             bool changed = bitmap[i / 8] & (1u << (i % 8));
             bool ok = changed ? read_exact(http, s, buf, n) : slots_->read_slot(src, off, buf, n);
             if (!ok || !slots_->write_staging(off, buf, n)) return false;
+            // Unchanged blocks (e.g. the frozen embedding table, ~2 MB) are flash-to-flash copies
+            // with no network waits; without this the task watchdog fires on IDLE0 after 5 s.
+            wdt_feed();
+            if (i % 16 == 15) vTaskDelay(1);
         }
         return true;
     }

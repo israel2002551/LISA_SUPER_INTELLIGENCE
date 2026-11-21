@@ -43,6 +43,8 @@ def test_gate():
     assert gate({"exact_match": 0.5, "val_loss": 1.0}, {"exact_match": 0.5, "val_loss": 0.9}, 0.0, False)[0]
     assert not gate({"mock": True}, {"mock": True}, 0.0, False)[0]
     assert gate({"mock": True}, {"mock": True}, 0.0, True)[0]
+    tiny = ({"exact_match": 0.0, "n_val": 4}, {"exact_match": 0.5, "n_val": 4})
+    assert not gate(*tiny, 0.0, False, min_val=20)[0] and gate(*tiny, 0.0, True, min_val=20)[0]
 
 
 def test_mock_run_publishes_v2_with_delta_and_ota_serves_it(client, ctx, base_image):
@@ -53,10 +55,11 @@ def test_mock_run_publishes_v2_with_delta_and_ota_serves_it(client, ctx, base_im
 
     rejected = run_evolution(ctx, create_run(ctx, "manual")["id"])
     assert rejected["status"] == "rejected" and "mock" in rejected["error"]
+    assert rejected["stats"]["synthetic_inserted"] > 0
 
     run = run_evolution(ctx, create_run(ctx, "manual", {"force_publish": True})["id"])
     assert run["status"] == "published", run
-    assert run["produced_version"] == 2 and run["stats"]["synthetic_inserted"] > 0
+    assert run["produced_version"] == 2 and run["stats"]["synthetic_inserted"] == 0   # stable synthesis: nothing new
     v2 = ctx.repo.get_model(2)
     assert v2["is_active"] and v2["parent_version"] == 1 and v2["delta_from_version"] == 1
 
@@ -98,3 +101,19 @@ def test_worker_policy_threshold_and_min_gap(client, ctx):
     ctx.settings.evolution_min_new_logs = 100
     assert should_trigger(ctx, 10_000.0, 10_000.0 - 601) is None       # under threshold, schedule not due
     assert should_trigger(ctx, 100_000.0, 0.0) == "schedule"
+
+
+def test_restart_from_older_version_is_gated_against_the_active_model(client, ctx, base_image):
+    headers = register(client)
+    bootstrap_model(ctx, base_image, 1)
+    _ingest(client, headers, [device_event(1)] + [interaction_event(10 + i, 20.0 + i, "NOP", "nop") for i in range(5)])
+    assert run_evolution(ctx, create_run(ctx, "manual", {"force_publish": True})["id"])["status"] == "published"
+    assert ctx.repo.get_active_model()["version"] == 2
+
+    run = run_evolution(ctx, create_run(ctx, "manual", {"base_version": 1, "force_publish": True})["id"])
+    assert run["status"] == "published", run
+    assert run["stats"]["base"] == "v1" and run["stats"]["baseline_model"] == "v2"
+    assert ctx.repo.get_model(3)["parent_version"] == 2          # lineage still follows the active model
+
+    bad = run_evolution(ctx, create_run(ctx, "manual", {"base_version": 99})["id"])
+    assert bad["status"] == "failed" and "base_version 99" in bad["error"]

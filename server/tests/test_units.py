@@ -141,3 +141,57 @@ def test_manifest_signatures():
     assert not s.verify(4, 5549120, sha, sig)
     assert manifest_message(3, 5549120, sha) == f"W25OTA1|3|5549120|{sha}".encode()
     assert s.public_pem_c_string().startswith('"-----BEGIN PUBLIC KEY-----\\n"')
+
+
+def test_blob_upload_retries_dropped_connections(monkeypatch):
+    import httpx
+
+    from app.db import supabase as sb
+
+    monkeypatch.setattr(sb.time, "sleep", lambda _s: None)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("x-upsert"))
+        if len(calls) < 3:
+            raise httpx.ReadError("connection reset", request=request)
+        return httpx.Response(200, json={"Key": "models/v2.w25img"})
+
+    store = sb.SupabaseBlobStore("https://example.supabase.co", "k")
+    store._http = httpx.Client(transport=httpx.MockTransport(handler))
+    store.put("models", "v2.w25img", b"\0" * 1024)
+    assert calls == ["true"] * 3          # two resets, then success; every attempt upserts
+
+    calls.clear()
+
+    def always_down(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise httpx.ConnectError("down", request=request)
+
+    store._http = httpx.Client(transport=httpx.MockTransport(always_down))
+    try:
+        store.put("models", "v2.w25img", b"x")
+        raise AssertionError("expected ConnectError")
+    except httpx.ConnectError:
+        pass
+    assert len(calls) == len(sb.RETRY_DELAYS_S) + 1
+
+
+def test_synth_covers_the_whole_range_balanced_and_stable():
+    """Boundary-only synthesis taught a real board 'NOP for everything'; the quota must be
+    filled across the range so every rule region is well represented."""
+    import collections
+    import json
+
+    from app.evolution.synth import synthesize
+
+    dev = DeviceContext(key="sim-thermo", type="thermostat", identified=True, data_format="json_lines",
+                        manifest=THERMO_MANIFEST, rules=list(THERMO_MANIFEST["rules"]))
+    rows = synthesize([dev], 400)
+    assert len(rows) == 400
+    assert [r["dedupe_key"] for r in rows] == [r["dedupe_key"] for r in synthesize([dev], 400)]   # no growth per run
+    temps = [json.loads(r["context_json"]["event"])["v"] for r in rows if '"temp"' in r["context_json"]["event"]]
+    assert min(temps) < 15 - 10 and max(temps) > 30 + 10
+    counts = collections.Counter(r["target_response"] for r in rows)
+    assert len(counts) >= 3 and min(counts.values()) >= 0.2 * len(rows), counts
+    assert sum(r["split"] == "val" for r in rows) >= 20
