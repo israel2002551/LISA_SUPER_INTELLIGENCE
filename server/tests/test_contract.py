@@ -40,6 +40,9 @@ def test_model_shape_matches_firmware():
     assert num(d["GEMMA_EMBED_SCALE"]) == SPEC.embed_scale
     assert num(d["W25_MODEL_MAGIC"]) == IMAGE_MAGIC
     assert num(d["W25_MODEL_HEADER_BYTES"]) == IMAGE_HEADER_BYTES
+    from app.evolution.model_spec import IMAGE_FLAG_TIED, IMAGE_FLAG_TOK_LISA
+    assert num(d["W25_MODEL_FLAG_TIED"]) == IMAGE_FLAG_TIED
+    assert num(d["W25_MODEL_FLAG_TOK_LISA"]) == IMAGE_FLAG_TOK_LISA
 
 
 def test_prompt_contract_and_slot_size_match_firmware():
@@ -47,6 +50,10 @@ def test_prompt_contract_and_slot_size_match_firmware():
     assert num(e["EDGE_EVENT_MAX_CHARS"]) == EVENT_MAX_CHARS
     assert num(e["EDGE_PROMPT_MAX_TOKENS"]) == PROMPT_MAX_TOKENS
     assert num(e["EDGE_ACTION_MAX_TOKENS"]) == ACTION_MAX_TOKENS
+    from app.evolution.model_spec import CHAT_MAX_CHARS
+    assert num(e["EDGE_CHAT_MAX_CHARS"]) == CHAT_MAX_CHARS
+    schema = (REPO_ROOT / "edge" / "action_schema.h").read_text(encoding="utf-8")
+    assert '"<u>%s<l>"' in schema                      # build_chat_prompt's tags
     layout = defines(REPO_ROOT / "edge" / "w25q_layout.h")
     assert num(layout["W25_SLOT_BYTES"]) == W25_SLOT_BYTES
 
@@ -61,4 +68,6 @@ def test_codec_writes_the_same_bytes_as_the_slicer():
     header = struct.pack(slicer.HEADER_FMT, cfg["magic"], cfg["version"], cfg["header_bytes"], cfg["hidden"],
                          cfg["intermediate"], cfg["heads"], cfg["layers"], cfg["vocab"], len(payload),
                          zlib.crc32(payload), cfg["flag_tied"], 0, 0, 0, 0, 0, 0)
-    assert image_codec.encode_image(image_codec.random_weights(seed=7), model_version=0) == header + payload
+    # The slicer writes untrained images, which carry no tokenizer flag.
+    assert image_codec.encode_image(image_codec.random_weights(seed=7), model_version=0,
+                                    lisa_tokenizer=False) == header + payload

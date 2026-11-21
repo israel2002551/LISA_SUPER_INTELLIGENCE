@@ -51,10 +51,24 @@ Everything runs on free tiers:
 
 ```bash
 cp edge/secrets.example.h edge/secrets.h     # then fill it in (never commit it)
-python -m esptool --chip esp32s3 -p COM3 -b 921600 write_flash 0x210000 tokenizer.bin
 pio run -e edge_node -t upload --upload-port COM3
 python gemma4/w25q128_upload.py COM3 <model image>.w25img
 ```
+
+LISA's tokenizer (`lisa_tokenizer.bin`) is built into the `edge_node` firmware. The `lisa_chat` build still reads `tokenizer.bin` from the `tokenizer` partition: `python -m esptool --chip esp32s3 -p COM3 -b 921600 write_flash 0x210000 tokenizer.bin`.
+
+## Talk to LISA
+
+Open a serial monitor on the board's port at **921600 baud**, with line ending **Newline**. Press RST once if it stays silent.
+
+| Type | What happens |
+|---|---|
+| `hello` (any text) | Chat. She knows about 80 topics: greetings, herself, feelings, jokes, the thermostat, how she learns. |
+| `/sim 33` | The simulated thermostat reports 33 °C; LISA decides what the fan does. |
+| `/sim auto 20` | 20 random temperatures, with a score. Every event becomes training data. |
+| `/status`, `/help` | Model version, slots, Wi-Fi; all commands. |
+
+She's a 2.75M-parameter model. Expect short, fixed replies on the topics she was trained on, and "I don't know that yet" elsewhere. She doesn't remember earlier messages.
 
 ## Tests
 

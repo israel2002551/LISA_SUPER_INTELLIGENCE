@@ -15,7 +15,8 @@ from app.evolution.teacher import RuleTeacher
 from app.main import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOKENIZER = REPO_ROOT / "tokenizer.bin"
+TOKENIZER = REPO_ROOT / "lisa_tokenizer.bin"          # what new models train with
+LEGACY_TOKENIZER = REPO_ROOT / "tokenizer.bin"       # byte tokens only (models v1-v3)
 ADMIN = {"Authorization": "Bearer dev-admin-token"}
 
 THERMO_MANIFEST = {

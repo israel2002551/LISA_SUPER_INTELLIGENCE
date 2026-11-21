@@ -26,6 +26,7 @@ from .curator import curate
 from .delta import build_delta, changed_blocks
 from .model_spec import BASE_MODEL, QUANTIZATION_FORMAT, SPEC
 from .signing import ManifestSigner
+from .chat_corpus import chat_rows
 from .synth import synthesize
 from .teacher import ClaudeTeacher, DeviceContext, RuleTeacher, Teacher
 from .tokenizer import BpeTokenizer
@@ -33,6 +34,7 @@ from .trainer import Example, TrainConfig, make_trainer
 
 log = logging.getLogger(__name__)
 TOKENIZER_BLOB = ("models", "assets/tokenizer.bin")
+LISA_TOKENIZER_BLOB = ("models", "assets/lisa_tokenizer.bin")
 
 
 def _now() -> str:
@@ -47,14 +49,27 @@ class EvolutionContext:
     signer: ManifestSigner
     teacher: Teacher
     _tokenizer: BpeTokenizer | None = None
+    _legacy_tokenizer: BpeTokenizer | None = None
 
     def tokenizer(self) -> BpeTokenizer:
-        """tokenizer.bin from disk, else from storage (models/assets/tokenizer.bin)."""
+        """The tokenizer new models train with: lisa_tokenizer.bin from disk, else from storage."""
         if self._tokenizer is None:
             path = self.settings.tokenizer_path
-            data = path.read_bytes() if path.is_file() else self.blobs.get(*TOKENIZER_BLOB)
+            data = path.read_bytes() if path.is_file() else self.blobs.get(*LISA_TOKENIZER_BLOB)
             self._tokenizer = BpeTokenizer(data, SPEC.vocab)
         return self._tokenizer
+
+    def legacy_tokenizer(self) -> BpeTokenizer:
+        """tokenizer.bin, whose first 4096 entries hold no single characters: byte tokens only.
+        Models without IMAGE_FLAG_TOK_LISA were trained (and run on the device) with it."""
+        if self._legacy_tokenizer is None:
+            path = self.settings.legacy_tokenizer_path
+            data = path.read_bytes() if path.is_file() else self.blobs.get(*TOKENIZER_BLOB)
+            self._legacy_tokenizer = BpeTokenizer(data, SPEC.vocab)
+        return self._legacy_tokenizer
+
+    def tokenizer_for(self, lisa_tokenizer: bool) -> BpeTokenizer:
+        return self.tokenizer() if lisa_tokenizer else self.legacy_tokenizer()
 
 
 def make_teacher(settings: Settings) -> Teacher:
@@ -101,25 +116,31 @@ def bootstrap_model(ctx: EvolutionContext, image: bytes, version: int = 1, label
     if ctx.repo.get_model(version):
         raise ValueError(f"model version {version} already exists")
     image = image_codec.set_model_version(image, version)
-    if ctx.settings.tokenizer_path.is_file():
-        ctx.blobs.put(*TOKENIZER_BLOB, ctx.settings.tokenizer_path.read_bytes())
+    for blob, path in ((LISA_TOKENIZER_BLOB, ctx.settings.tokenizer_path),
+                       (TOKENIZER_BLOB, ctx.settings.legacy_tokenizer_path)):
+        if path.is_file():   # so workers without the files in their checkout can still train
+            ctx.blobs.put(*blob, path.read_bytes())
     return publish_image(ctx, image, parent=None, label=label)
 
 
-def _base_weights(ctx: EvolutionContext, parent: dict[str, Any] | None) -> tuple[image_codec.Weights, str]:
+def _base_weights(ctx: EvolutionContext, parent: dict[str, Any] | None) -> tuple[image_codec.Weights, str, bool]:
+    """(weights, name, trained with lisa_tokenizer.bin?)"""
     if parent:
-        return image_codec.decode_image(ctx.blobs.get("models", parent["storage_path"])), f"v{parent['version']}"
+        image = ctx.blobs.get("models", parent["storage_path"])
+        return (image_codec.decode_image(image), f"v{parent['version']}",
+                image_codec.read_header(image).lisa_tokenizer)
     p = ctx.settings.bootstrap_image_path
     if p and p.is_file():
-        return image_codec.decode_image(p.read_bytes()), str(p)
-    return image_codec.random_weights(), "random-init"
+        image = p.read_bytes()
+        return image_codec.decode_image(image), str(p), image_codec.read_header(image).lisa_tokenizer
+    return image_codec.random_weights(), "random-init", True
 
 
 # ---------------------------------------------------------------------------
 # Gate
 # ---------------------------------------------------------------------------
 def gate(baseline: dict[str, Any], metrics: dict[str, Any], min_improvement: float, force: bool,
-         min_val: int = 0) -> tuple[bool, str]:
+         min_val: int = 0, max_task_regression: float = 1.0) -> tuple[bool, str]:
     if force:
         return True, "forced"
     if metrics.get("mock"):
@@ -129,6 +150,11 @@ def gate(baseline: dict[str, Any], metrics: dict[str, Any], min_improvement: flo
     n_val = metrics.get("n_val", baseline.get("n_val"))
     if n_val is not None and n_val < min_val:
         return False, f"only {n_val} validation examples (< {min_val}); too few to judge"
+    # Getting better at chat must not cost the device skills (and vice versa).
+    for task, b in (baseline.get("tasks") or {}).items():
+        c = (metrics.get("tasks") or {}).get(task)
+        if c is not None and c["exact_match"] < b["exact_match"] - max_task_regression:
+            return False, f"{task} regressed (exact match {b['exact_match']:.3f} -> {c['exact_match']:.3f})"
     b_em, c_em = baseline.get("exact_match"), metrics.get("exact_match")
     if c_em is None or b_em is None:
         return False, "no validation examples to compare on"
@@ -166,12 +192,15 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
         devices = [DeviceContext.from_row(d) for d in repo.list_uart_devices()]
         synth_rows = synthesize(devices, s.synth_per_device)   # stable per device: re-runs add nothing new
         stats["synthetic_inserted"] = repo.insert_examples(synth_rows)
+        if s.chat_enabled:
+            stats["chat_inserted"] = repo.insert_examples(chat_rows())   # stable corpus: re-runs add nothing
 
         manifests = {d.key: d.manifest for d in devices}
 
         def to_example(r: dict[str, Any]) -> Example:
             key = (r.get("context_json") or {}).get("device_key", "")
-            return Example(r["prompt"].encode("utf-8"), r["target_response"], manifests.get(key, {}))
+            task = (r.get("context_json") or {}).get("task", "action")
+            return Example(r["prompt"].encode("utf-8"), r["target_response"], manifests.get(key, {}), task)
 
         train = [to_example(r) for r in repo.list_examples("train")]
         val = [to_example(r) for r in repo.list_examples("val")]
@@ -187,26 +216,31 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
             start = repo.get_model(int(params["base_version"]))
             if start is None:
                 raise ValueError(f"unknown base_version {params['base_version']}")
-        base, base_name = _base_weights(ctx, start)
+        base, base_name, _ = _base_weights(ctx, start)   # retrained with the current tokenizer either way
         cfg = TrainConfig(steps=int(params.get("steps", s.train_steps)), batch_size=s.train_batch_size,
                           lr=float(params.get("lr", s.train_lr)), method=params.get("method", s.train_method),
-                          lora_rank=s.lora_rank, freeze_embeddings=s.freeze_embeddings, seed=len(train),
-                          schedule=s.train_schedule, warmup_steps=s.train_warmup_steps)
+                          lora_rank=s.lora_rank, seed=len(train),
+                          freeze_embeddings=bool(params.get("freeze_embeddings", s.freeze_embeddings)),
+                          schedule=s.train_schedule,
+                          warmup_steps=max(s.train_warmup_steps, int(params.get("steps", s.train_steps)) // 20))
         trainer = make_trainer(params.get("trainer") or s.trainer, s.remote_trainer_url,
                                s.remote_trainer_token.get_secret_value() if s.remote_trainer_token else None)
         result = trainer.train(base, train, val, ctx.tokenizer(), cfg)
         baseline = result.baseline
-        if parent is not None and start is not parent:
-            # The gate compares with what devices run now, not with the restart point.
-            if not hasattr(trainer, "evaluate_weights"):
-                raise ValueError(f"base_version needs a trainer that can evaluate the active model ({trainer.name} can't)")
-            parent_weights, _ = _base_weights(ctx, parent)
-            baseline = trainer.evaluate_weights(parent_weights, val, ctx.tokenizer(), cfg)
+        if parent is not None:
+            parent_weights, _, parent_lisa_tok = _base_weights(ctx, parent)
+            # The gate compares with what devices run now, scored with the tokenizer that model
+            # runs with: not with a restart point, and not through a tokenizer it never saw.
+            if start is not parent or not parent_lisa_tok:
+                if not hasattr(trainer, "evaluate_weights"):
+                    raise ValueError(f"can't score the active model with {trainer.name}; it has no evaluate_weights")
+                baseline = trainer.evaluate_weights(parent_weights, val, ctx.tokenizer_for(parent_lisa_tok), cfg)
         stats.update(base=base_name, baseline_model=f"v{parent['version']}" if parent else base_name,
                      trainer=trainer.name, baseline=baseline, candidate=result.metrics)
 
         # 4. Gate
-        ok, reason = gate(baseline, result.metrics, s.gate_min_improvement, force, s.gate_min_val_examples)
+        ok, reason = gate(baseline, result.metrics, s.gate_min_improvement, force, s.gate_min_val_examples,
+                          s.gate_max_task_regression)
         stats["gate"] = reason
         if not ok:
             return _finish(ctx, run_id, "rejected", stats, reason)

@@ -52,6 +52,7 @@ static const uint32_t kEdgeBaudCandidates[] = {9600, 115200, 921600, 2000000};
 //   {"cmd":"set_fan","args":{"level":2}} is ~35 tokens, so actions get 48.
 //   Prompt + action must fit GEMMA_MAX_CONTEXT_LENGTH (128); checked in inference_task.h.
 #define EDGE_EVENT_MAX_CHARS          120
+#define EDGE_CHAT_MAX_CHARS           150   // bytes of a chat message kept (server: CHAT_MAX_CHARS)
 #define EDGE_PROMPT_MAX_TOKENS        80    // including BOS
 #define EDGE_ACTION_MAX_TOKENS        48
 

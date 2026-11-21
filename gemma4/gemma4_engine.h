@@ -55,6 +55,9 @@ struct Gemma4Int16Model {
 static Gemma4Int16Model g_model;
 static uint8_t* g_model_blob = nullptr;
 static BpeTokenizer* g_tokenizer = nullptr;
+// The loaded model was trained with the BPE tokenizer (W25_MODEL_FLAG_TOK_LISA). Older
+// images saw only byte tokens <0x00>..<0xFF>, so they keep getting those.
+static bool g_tok_bpe = false;
 static UnifiedCacheManager g_cache_mgr;
 
 // Activation buffers (internal SRAM)
@@ -92,6 +95,17 @@ static void gemma_start_gemm_worker(UBaseType_t priority = GEMM_WORKER_PRIORITY)
     xTaskCreatePinnedToCore(core0_q16_gemm_worker, "Core0_Q16_GEMM", 4096,
                             xTaskGetCurrentTaskHandle(), priority, &g_core0_q16_handle, 0);
     while (!g_core0_q16_ready) delay(10);
+}
+
+// Uses a tokenizer image already in memory (e.g. built into the firmware); `data` must stay valid.
+static bool gemma_init_tokenizer_from(const uint8_t* data, size_t size) {
+    if (!g_tokenizer) {
+        g_tokenizer = (BpeTokenizer*)heap_caps_malloc(sizeof(BpeTokenizer), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_tokenizer) g_tokenizer = (BpeTokenizer*)malloc(sizeof(BpeTokenizer));
+        if (!g_tokenizer) return false;
+        new (g_tokenizer) BpeTokenizer();
+    }
+    return g_tokenizer->init(data, size);
 }
 
 // Loads tokenizer.bin from the ESP32-S3's own flash ('tokenizer' partition, memory-mapped).
@@ -170,6 +184,11 @@ static bool gemma_load_model(uint32_t base_addr, uint32_t max_bytes, uint8_t out
 
     W25ModelHeader h;
     if (!gemma_read_image_header(base_addr, h)) return false;
+    g_tok_bpe = (h.flags & W25_MODEL_FLAG_TOK_LISA) != 0;
+    if (g_tok_bpe && !(g_tokenizer && g_tokenizer->initialized)) {
+        Serial.println("[Model] This model needs the LISA tokenizer, which isn't loaded; its output will be garbage.");
+    }
+    Serial.printf("[Model] Tokenizer: %s\n", g_tok_bpe ? "LISA BPE (4096)" : "byte tokens (legacy model)");
     if (W25_MODEL_HEADER_BYTES + h.payload_bytes > max_bytes || base_addr + W25_MODEL_HEADER_BYTES + h.payload_bytes > g_w25_size) {
         Serial.println("[Model] Image is larger than its flash region.");
         return false;
@@ -218,10 +237,10 @@ static bool gemma_load_model(uint32_t base_addr, uint32_t max_bytes, uint8_t out
 // ==============================================================================
 static int gemma_tokenize(const char* text, uint32_t* out, int max_tokens) {
     if (!text || !*text || max_tokens <= 0) return 0;
-    if (g_tokenizer && g_tokenizer->initialized) {
+    if (g_tok_bpe && g_tokenizer && g_tokenizer->initialized) {
         return g_tokenizer->encode(String(text), out, max_tokens);
     }
-    // No tokenizer partition: fall back to byte tokens <0x00>..<0xFF>
+    // Legacy model (or no tokenizer): byte tokens <0x00>..<0xFF>
     int n = 0;
     for (const char* p = text; *p && n < max_tokens; p++) {
         out[n++] = GEMMA_BYTE_TOKEN_OFFSET + (uint8_t)*p;

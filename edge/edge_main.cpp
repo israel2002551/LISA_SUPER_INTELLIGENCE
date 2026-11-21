@@ -21,6 +21,7 @@
 #include "edge_messages.h"
 #include "uart_link.h"
 #include "inference_task.h"
+#include "lisa_tokenizer_data.h"
 #include "net_sync.h"
 
 static Preferences g_prefs;
@@ -210,10 +211,12 @@ static bool console_infer(const char* prompt, uint32_t act_id, InferResult& r) {
     return true;
 }
 
-// /ask <text>: any text straight into LISA's model.
+// Chat: anything typed that isn't a /command (or /ask <text>).
 static void ask_lisa(const char* text) {
+    char prompt[sizeof(InferRequest::prompt)];
+    edge_build_chat_prompt(text, prompt, sizeof(prompt));
     InferResult r;
-    if (!console_infer(text, 0, r)) return;
+    if (!console_infer(prompt, 0, r)) return;
     Serial.printf("LISA: %s\n      [%u ms, model v%u]\n", r.output[0] ? r.output : "(no output)", (unsigned)r.latency_ms,
                   (unsigned)r.model_version);
 }
@@ -333,7 +336,7 @@ static void simulate(const char* args) {
 
 static void print_help() {
     Serial.println("\n--- LISA console ---");
-    Serial.println(" /ask <text>         Send any text to LISA's model and show her answer");
+    Serial.println(" <any text>          Chat with LISA (or /ask <text>)");
     Serial.println(" /sim <temp>         Simulate a thermostat event; LISA decides, the thermostat judges");
     Serial.println(" /sim auto <n>       n random thermostat events (training data for LISA)");
     Serial.println(" /status             Model, slots, ring log, UART link, Wi-Fi");
@@ -363,6 +366,7 @@ static void handle_command(const char* cmd) {
             Serial.println("No GOOD model in the other slot.");
         }
     } else if (strncmp(cmd, "/w25write ", 10) == 0) provision_over_usb(cmd + 10);
+    else if (cmd[0] != '/') ask_lisa(cmd);
     else Serial.println("Unknown command. Type /help.");
 }
 
@@ -390,7 +394,9 @@ void setup() {
         while (1) delay(1000);
     }
     gemma_start_gemm_worker(GEMM_WORKER_PRIORITY);
-    if (!gemma_init_tokenizer()) Serial.println("[Init] Warning: 'tokenizer' partition missing; using byte tokens.");
+    if (!gemma_init_tokenizer_from(kLisaTokenizer, kLisaTokenizerBytes)) {
+        Serial.println("[Init] Warning: built-in tokenizer failed to load; models get byte tokens.");
+    }
     if (!g_cache_mgr.kv.init(GEMMA_MAX_CONTEXT_LENGTH)) {
         Serial.println("[FATAL] KV cache allocation failed. Halting.");
         while (1) delay(1000);
@@ -424,7 +430,7 @@ void setup() {
                   (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 }
 
-static char s_input[128];
+static char s_input[EDGE_CHAT_MAX_CHARS + 32];
 static int s_input_len = 0;
 
 void loop() {

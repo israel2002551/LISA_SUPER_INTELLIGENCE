@@ -6,7 +6,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .model_spec import ACTION_MAX_TOKENS, EVENT_MAX_CHARS, PROMPT_MAX_TOKENS, SPEC
+from .model_spec import (ACTION_MAX_TOKENS, CHAT_LISA_TAG, CHAT_MAX_CHARS, CHAT_USER_TAG, EVENT_MAX_CHARS,
+                         PROMPT_MAX_TOKENS, SPEC)
 from .tokenizer import BpeTokenizer
 
 NOP = "NOP"
@@ -22,6 +23,17 @@ def build_prompt(device_key: str, device_type: str, event: str | bytes) -> bytes
     key = device_key.encode("utf-8")[:KEY_MAX]
     typ = (device_type or "").encode("utf-8")[:TYPE_MAX]
     return (b"<d>" + key + b":" + typ + b"<e>" + ev + b"<a>")[:PROMPT_MAX_BYTES]
+
+
+def build_chat_prompt(text: str | bytes) -> bytes:
+    """"<u>{text}<l>": CR/LF -> space, trimmed, cut to CHAT_MAX_CHARS bytes (edge_build_chat_prompt)."""
+    t = text.encode("utf-8") if isinstance(text, str) else bytes(text)
+    t = t.replace(b"\r", b" ").replace(b"\n", b" ").strip(b" \t")[:CHAT_MAX_CHARS]
+    return CHAT_USER_TAG + t + CHAT_LISA_TAG
+
+
+def is_chat_prompt(prompt: bytes) -> bool:
+    return prompt.startswith(CHAT_USER_TAG)
 
 
 def canonical_action(cmd: str, args: dict[str, Any] | None) -> str:

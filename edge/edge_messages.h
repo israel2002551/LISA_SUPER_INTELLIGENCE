@@ -18,5 +18,5 @@ struct InferResult {
     uint32_t latency_ms;     // queue wait + inference
     uint32_t model_version;
     bool model_ready;        // false: no model loaded, output is empty
-    char output[160];        // decoded text, first line only
+    char output[256];        // decoded text, first line only (chat replies run up to ~200 chars)
 };

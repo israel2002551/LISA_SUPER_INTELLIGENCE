@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .model_spec import (
-    IMAGE_FLAG_TIED, IMAGE_FORMAT_VERSION, IMAGE_HEADER_BYTES, IMAGE_HEADER_FMT, IMAGE_MAGIC,
+    IMAGE_FLAG_TIED, IMAGE_FLAG_TOK_LISA, IMAGE_FORMAT_VERSION, IMAGE_HEADER_BYTES, IMAGE_HEADER_FMT, IMAGE_MAGIC,
     PSRAM_MODEL_BUDGET, SPEC, W25_SLOT_BYTES, ModelSpec,
 )
 
@@ -68,9 +68,16 @@ class ImageInfo:
     size: int
     payload_crc32: int
     sha256: str
+    flags: int = IMAGE_FLAG_TIED
+
+    @property
+    def lisa_tokenizer(self) -> bool:
+        return bool(self.flags & IMAGE_FLAG_TOK_LISA)
 
 
-def encode_image(w: Weights, model_version: int, spec: ModelSpec = SPEC) -> bytes:
+def encode_image(w: Weights, model_version: int, spec: ModelSpec = SPEC, *, lisa_tokenizer: bool = True) -> bytes:
+    """lisa_tokenizer: the weights were trained with lisa_tokenizer.bin (flag in the header, so the
+    firmware and the server pick the matching tokenizer); False only for legacy byte-token models."""
     shapes = weight_shapes(spec)
     for name, shape in shapes.items():
         if tuple(w[name].shape) != shape:
@@ -88,7 +95,8 @@ def encode_image(w: Weights, model_version: int, spec: ModelSpec = SPEC) -> byte
         raise AssertionError(f"payload {len(payload)} != layout {spec.payload_bytes}")
     header = struct.pack(IMAGE_HEADER_FMT, IMAGE_MAGIC, IMAGE_FORMAT_VERSION, IMAGE_HEADER_BYTES,
                          spec.hidden, spec.intermediate, spec.heads, spec.layers, spec.vocab,
-                         len(payload), zlib.crc32(payload), IMAGE_FLAG_TIED, model_version, 0, 0, 0, 0, 0)
+                         len(payload), zlib.crc32(payload),
+                         IMAGE_FLAG_TIED | (IMAGE_FLAG_TOK_LISA if lisa_tokenizer else 0), model_version, 0, 0, 0, 0, 0)
     image = header + payload
     check_budget(image)
     return image
@@ -107,7 +115,7 @@ def read_header(image: bytes, spec: ModelSpec = SPEC) -> ImageInfo:
         raise ValueError("image size doesn't match its header")
     if zlib.crc32(image[hbytes:]) != crc:
         raise ValueError("payload CRC mismatch")
-    return ImageInfo(model_version, len(image), crc, hashlib.sha256(image).hexdigest())
+    return ImageInfo(model_version, len(image), crc, hashlib.sha256(image).hexdigest(), flags)
 
 
 def decode_image(image: bytes, spec: ModelSpec = SPEC) -> Weights:

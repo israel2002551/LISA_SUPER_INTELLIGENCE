@@ -118,6 +118,22 @@ static int edge_build_prompt(const DeviceProfile& p, const char* event, char* ou
     return snprintf(out, out_len, "<d>%s:%s<e>%s<a>", p.key, p.type, ev);
 }
 
+// Chat (contract with build_chat_prompt in server/app/evolution/prompt_format.py):
+// "<u>" + text + "<l>", with CR/LF -> space, trimmed, cut to EDGE_CHAT_MAX_CHARS bytes.
+static int edge_build_chat_prompt(const char* text, char* out, size_t out_len) {
+    // Same order as Python: CR/LF become spaces, the ends are trimmed, then the cut.
+    auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const char* s = text;
+    while (blank(*s)) s++;
+    size_t len = strlen(s);
+    while (len && blank(s[len - 1])) len--;
+    if (len > EDGE_CHAT_MAX_CHARS) len = EDGE_CHAT_MAX_CHARS;
+    char t[EDGE_CHAT_MAX_CHARS + 1];
+    for (size_t i = 0; i < len; i++) t[i] = (s[i] == '\r' || s[i] == '\n') ? ' ' : s[i];
+    t[len] = '\0';
+    return snprintf(out, out_len, "<u>%s<l>", t);
+}
+
 // ---- Validation -------------------------------------------------------------------
 // "LO..HI", e.g. "0..3", "-1.5..2.5". Split on ".." first: strtod("0..3") would
 // consume "0." as a number and leave ".3", so every integer range used to fail

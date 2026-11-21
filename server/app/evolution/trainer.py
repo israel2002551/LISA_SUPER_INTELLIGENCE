@@ -37,6 +37,7 @@ class Example:
     prompt: bytes
     target: str
     manifest: dict[str, Any] = field(default_factory=dict)
+    task: str = "action"          # action | chat
 
 
 @dataclass
@@ -112,15 +113,26 @@ class TorchTrainer:
                 logits = model(torch.tensor([seq[:-1]]))[0]
                 tgt = torch.tensor(seq[1:])
                 losses.append(float(torch.nn.functional.cross_entropy(logits[n_prompt - 1:], tgt[n_prompt - 1:])))
-        exact = valid = 0
-        subset = val[: cfg.eval_limit]
-        for ex in subset:
-            out = model.greedy(prompt_tokens(tok, ex.prompt), ACTION_MAX_TOKENS)
-            text = tok.decode(out).decode("utf-8", "replace").split("\n", 1)[0]
-            exact += canonicalize_output(text) == ex.target
-            valid += validate_action(ex.manifest, text)[0] != "invalid"
-        return {"n_val": len(val), "val_loss": float(np.mean(losses)), "exact_match": exact / len(subset),
-                "valid_action_rate": valid / len(subset)}
+        # Decode up to eval_limit examples per task. exact_match is the mean over tasks, so a
+        # few dozen device examples weigh as much as hundreds of chat lines.
+        tasks: dict[str, dict[str, Any]] = {}
+        valid = n_action = 0
+        for task in sorted({ex.task for ex in val}):
+            subset = [ex for ex in val if ex.task == task][: cfg.eval_limit]
+            exact = 0
+            for ex in subset:
+                out = model.greedy(prompt_tokens(tok, ex.prompt), ACTION_MAX_TOKENS)
+                text = tok.decode(out).decode("utf-8", "replace").split("\n", 1)[0]
+                if task == "chat":
+                    exact += text.strip() == ex.target.strip()
+                else:
+                    exact += canonicalize_output(text) == ex.target
+                    valid += validate_action(ex.manifest, text)[0] != "invalid"
+                    n_action += 1
+            tasks[task] = {"n": len(subset), "exact_match": exact / len(subset)}
+        return {"n_val": len(val), "val_loss": float(np.mean(losses)),
+                "exact_match": float(np.mean([t["exact_match"] for t in tasks.values()])),
+                "valid_action_rate": valid / n_action if n_action else None, "tasks": tasks}
 
     def evaluate_weights(self, weights: Weights, val: list[Example], tok: BpeTokenizer, cfg: TrainConfig) -> dict[str, Any]:
         from .model import EdgeGemma

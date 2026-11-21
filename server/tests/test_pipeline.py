@@ -117,3 +117,12 @@ def test_restart_from_older_version_is_gated_against_the_active_model(client, ct
 
     bad = run_evolution(ctx, create_run(ctx, "manual", {"base_version": 99})["id"])
     assert bad["status"] == "failed" and "base_version 99" in bad["error"]
+
+
+def test_gate_refuses_a_task_regression():
+    base = {"exact_match": 0.5, "n_val": 40, "tasks": {"action": {"exact_match": 0.97}, "chat": {"exact_match": 0.0}}}
+    worse_device = {"exact_match": 0.6, "n_val": 40, "tasks": {"action": {"exact_match": 0.80}, "chat": {"exact_match": 0.4}}}
+    ok, reason = gate(base, worse_device, 0.0, False, 20, 0.05)
+    assert not ok and "action regressed" in reason
+    better = {"exact_match": 0.9, "n_val": 40, "tasks": {"action": {"exact_match": 0.95}, "chat": {"exact_match": 0.85}}}
+    assert gate(base, better, 0.0, False, 20, 0.05)[0]

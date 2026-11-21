@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"     # used for local signed download URLs
 
     # --- Model / tokenizer ---
-    tokenizer_path: Path = SERVER_DIR.parent / "tokenizer.bin"
+    tokenizer_path: Path = SERVER_DIR.parent / "lisa_tokenizer.bin"        # new models (tools/build_lisa_tokenizer.py)
+    legacy_tokenizer_path: Path = SERVER_DIR.parent / "tokenizer.bin"      # models without IMAGE_FLAG_TOK_LISA
     bootstrap_image_path: Path | None = None           # used when no model version exists yet
 
     # --- Evolution ---
@@ -61,6 +62,8 @@ class Settings(BaseSettings):
     train_method: Literal["full", "lora"] = "full"
     lora_rank: int = 8
     freeze_embeddings: bool = True                     # keeps OTA deltas ~2 MiB smaller
+    chat_enabled: bool = True                          # train the conversation corpus (chat_corpus.py) too
+    gate_max_task_regression: float = 0.05             # no task (actions, chat) may lose more exact match than this
     gate_min_improvement: float = 0.0                  # exact-match gain needed to publish
     gate_min_val_examples: int = 20                    # fewer can't separate learning from "always the majority answer"
     auto_activate: bool = True

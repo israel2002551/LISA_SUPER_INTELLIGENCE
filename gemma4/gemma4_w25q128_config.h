@@ -83,6 +83,7 @@
 #define W25_MODEL_VERSION        1
 #define W25_MODEL_HEADER_BYTES   64
 #define W25_MODEL_FLAG_TIED      0x1u
+#define W25_MODEL_FLAG_TOK_LISA  0x2u   // trained with lisa_tokenizer.bin; unset = legacy byte tokens
 
 struct W25ModelHeader {
     uint32_t magic;

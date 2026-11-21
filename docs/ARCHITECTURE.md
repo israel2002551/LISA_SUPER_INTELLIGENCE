@@ -140,12 +140,26 @@ dev  -> {"ack":42,"ok":true}       dev -> {"fb":"good","id":42}   (feedback is o
 
 ### Prompt contract (`edge_config.h` ↔ `server/app/evolution/prompt_format.py`)
 ```
-prompt = "<d>" + device_key + ":" + device_type + "<e>" + event[:120 bytes, CR/LF -> space] + "<a>"
+device:  prompt = "<d>" + device_key + ":" + device_type + "<e>" + event[:120 bytes, CR/LF -> space] + "<a>"
+         target = "NOP"  |  {"cmd":"...","args":{...}}  (compact JSON, args sorted)
+chat:    prompt = "<u>" + text[CR/LF -> space, trimmed, :150 bytes] + "<l>"
+         target = one-line reply
 tokens = [BOS] + bpe(prompt)[:79]              (80-token prompt budget)
 output = greedy decode, up to 48 tokens, first line
-target = "NOP"  |  {"cmd":"...","args":{...}}  (compact JSON, args sorted)
 ```
 `tests/test_contract.py` parses the C headers and fails if either side drifts.
+
+**Tokenizer.** `lisa_tokenizer.bin` is a 4096-entry BPE vocabulary built by `tools/build_lisa_tokenizer.py`:
+- **Entries:** byte fallbacks, every printable ASCII character, and the 3742 highest-priority ASCII merges of the Llama-2 tokenizer.
+- **On the device:** it is built into the firmware (`edge/lisa_tokenizer_data.h`, checked against the file by the tests).
+- **Each image records its tokenizer** with `W25_MODEL_FLAG_TOK_LISA`. The firmware and the server use the matching one, so models v1–v3 keep their byte tokens.
+- **Why it was needed:** the first 4096 entries of the Llama tokenizer (`tokenizer.bin`) contain no single characters. Every character fell back to a byte token, and no merge ever happened. The new vocabulary needs 2–2.4× fewer tokens for the same text.
+
+**Chat.** Anything typed on the USB console that isn't a `/command` is a chat message (`/ask <text>` also works).
+- **Corpus:** `server/app/evolution/chat_corpus.py` holds about 80 intents. Each has many phrasings and one reply; out-of-scope questions get "I don't know that yet".
+- **Variants:** each phrasing is expanded with case, punctuation and "lisa, ..." forms.
+- **Validation:** whole phrasings are held out for validation, so the score measures understanding of new wordings.
+- **Mixed training:** the corpus trains alongside the device examples. The gate rejects a candidate if either task loses more than 0.05 exact match.
 
 ### Safety
 - **Validation:** model output is never sent to hardware unless it is `NOP` or a command from the device's own manifest. Every argument must be present and in range. Anything else is logged as `invalid_output`, which becomes training signal.
@@ -211,7 +225,13 @@ It also helps `/uart/classify` when the heuristics aren't confident.
   | 68 examples clustered at the thresholds (v2) | "NOP" for everything |
 
   The gate now needs at least 20 validation examples, because v2 passed on 4.
-- **Inference:** `NOP` takes about 4 s; a JSON action (~36 tokens) takes 8–11 s.
+- **Inference (byte tokens, v1–v3):** `NOP` took about 4 s; a JSON action (~36 tokens) took 8–11 s.
+- **Chat and the new tokenizer (v4):** trained from scratch on 2254 examples (chat corpus plus thermostat) for 3000 steps at lr 1e-3 with cosine decay and trainable embeddings, in 12 minutes on a desktop CPU.
+  - **Held-out score:** thermostat 1.00; chat 0.42 exact on phrasings never seen in training.
+  - **On the board:** a 14-turn scripted conversation got 14/14 replies right, at 2.3–5.6 s per reply.
+  - **Thermostat after chat training:** still 24/24; a fan command now takes ~5 s instead of 9–10 s.
+  - **Calibration, held-out chat scores:** frozen embeddings gave 0.45 but sometimes blended replies into nonsense; trainable embeddings gave 0.43 with always-whole replies; lr 2e-3 gave 0.35; 6000 steps gave 0.41 (memorizes).
+  - **Known limit:** each message is answered on its own (no memory of earlier turns). Unusual wordings get a coherent reply that is right about 40 % of the time.
 - **OTA:** the v2→v3 delta was 3.4 MB of a 5.5 MB image. Erasing the 5.4 MB staging area took 14.8 s, longer than the 5 s task watchdog, so erase, patch and verify feed the watchdog from the net task (`edge/wdt_scope.h`). Model load from the W25Q into PSRAM takes 2.2 s.
 
 Not yet measured on hardware: a physical UART peripheral (only the simulator so far) and ESP-NOW/TCP links.

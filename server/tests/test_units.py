@@ -195,3 +195,72 @@ def test_synth_covers_the_whole_range_balanced_and_stable():
     counts = collections.Counter(r["target_response"] for r in rows)
     assert len(counts) >= 3 and min(counts.values()) >= 0.2 * len(rows), counts
     assert sum(r["split"] == "val" for r in rows) >= 20
+
+
+# ---------------- LISA tokenizer + chat ----------------
+
+def test_lisa_tokenizer_has_characters_and_merges(tok):
+    from .conftest import LEGACY_TOKENIZER
+
+    assert tok.vocab[3] == b"<0x00>" and tok.vocab[258] == b"<0xFF>" and len(tok.vocab) == 4096
+    assert all(bytes([c]) in tok._first for c in range(0x20, 0x7F))        # every printable character
+    text = "Hello, I am LISA. How are you today?"
+    ids = tok.encode(text)
+    assert tok.decode(ids).decode() == text and len(ids) <= 16              # word pieces, not bytes
+    legacy = BpeTokenizer.from_file(LEGACY_TOKENIZER)
+    assert legacy.encode(text) == [3 + b for b in text.encode()]            # what models v1-v3 saw
+
+
+def test_firmware_copy_of_the_tokenizer_matches_the_file():
+    import re
+    import zlib
+
+    from .conftest import REPO_ROOT, TOKENIZER
+
+    data = TOKENIZER.read_bytes()
+    header = (REPO_ROOT / "edge" / "lisa_tokenizer_data.h").read_text(encoding="utf-8")
+    assert int(re.search(r"kLisaTokenizerCrc32 = 0x([0-9a-f]+)u", header).group(1), 16) == zlib.crc32(data)
+    body = header[header.index("kLisaTokenizer[] = {"):]
+    assert bytes(int(h, 16) for h in re.findall(r"0x([0-9a-f]{2})\b", body)) == data
+
+
+def test_image_flags_record_the_tokenizer():
+    w = image_codec.random_weights(seed=3)
+    assert image_codec.read_header(image_codec.encode_image(w, 1)).lisa_tokenizer
+    assert not image_codec.read_header(image_codec.encode_image(w, 1, lisa_tokenizer=False)).lisa_tokenizer
+
+
+def test_chat_prompt_contract():
+    from app.evolution.prompt_format import build_chat_prompt, is_chat_prompt
+
+    assert build_chat_prompt("  hello lisa\r\n") == b"<u>hello lisa<l>"
+    assert build_chat_prompt("x" * 400) == b"<u>" + b"x" * 150 + b"<l>"
+    assert is_chat_prompt(build_chat_prompt("hi")) and not is_chat_prompt(b"<d>a:b<e>{}<a>")
+
+
+def test_chat_corpus_fits_the_device_and_splits_by_phrasing(tok):
+    import collections
+
+    from app.evolution.chat_corpus import INTENTS, chat_rows
+    from app.evolution.model_spec import ACTION_MAX_TOKENS, PROMPT_MAX_TOKENS
+    from app.evolution.prompt_format import prompt_tokens
+
+    rows = chat_rows()
+    assert [r["dedupe_key"] for r in rows] == [r["dedupe_key"] for r in chat_rows()]       # stable
+    owner = {}
+    for intent, phrasings, reply in INTENTS:
+        assert len(tok.encode(reply.encode())) < ACTION_MAX_TOKENS, reply                  # + EOS fits
+        for p in phrasings:
+            assert owner.setdefault(p, intent) == intent, f"'{p}' is in {owner[p]} and {intent}"
+    for r in rows:
+        assert len(prompt_tokens(tok, r["prompt"].encode())) < PROMPT_MAX_TOKENS
+    by_split = collections.Counter(r["split"] for r in rows)
+    assert by_split["val"] >= 60 and by_split["train"] >= 8 * by_split["val"] // 2
+    trained = {r["context_json"]["intent"] for r in rows if r["split"] == "train"}
+    assert trained == {i for i, _, _ in INTENTS}                                           # every intent learnable
+    # all typed forms of one phrasing share a split, so val measures unseen phrasings
+    splits = collections.defaultdict(set)
+    for r in rows:
+        core = r["prompt"][3:-3].lower().removeprefix("lisa, ").rstrip("?!.").removesuffix(", lisa")
+        splits[(r["context_json"]["intent"], core)].add(r["split"])
+    assert all(len(s) == 1 for s in splits.values())

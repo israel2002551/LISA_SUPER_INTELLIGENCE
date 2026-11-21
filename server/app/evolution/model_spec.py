@@ -56,6 +56,7 @@ IMAGE_MAGIC = 0x31573447          # "G4W1"
 IMAGE_FORMAT_VERSION = 1
 IMAGE_HEADER_BYTES = 64
 IMAGE_FLAG_TIED = 0x1
+IMAGE_FLAG_TOK_LISA = 0x2         # trained with lisa_tokenizer.bin; unset = legacy byte tokens (tokenizer.bin)
 IMAGE_HEADER_FMT = "<IHH8I6I"     # magic, version, header_bytes, 8 x u32, model_version + 5 reserved
 
 # edge/w25q_layout.h
@@ -65,7 +66,12 @@ PSRAM_MODEL_BUDGET = 6 * 1024 * 1024
 # Prompt contract (edge/edge_config.h)
 EVENT_MAX_CHARS = 120
 PROMPT_MAX_TOKENS = 80            # including BOS
-ACTION_MAX_TOKENS = 48            # compact JSON actions are ~35 tokens with this vocabulary
+ACTION_MAX_TOKENS = 48            # output budget (actions and chat replies); an action is ~21 tokens
+
+# Chat contract (edge/action_schema.h edge_build_chat_prompt): "<u>" + text + "<l>" -> reply, EOS
+CHAT_USER_TAG = b"<u>"
+CHAT_LISA_TAG = b"<l>"
+CHAT_MAX_CHARS = 150              # bytes of user text kept
 
 QUANTIZATION_FORMAT = "q16_rowscale_tied"
 BASE_MODEL = "lisa-gemma4-int16-h256-l2-v4096"
