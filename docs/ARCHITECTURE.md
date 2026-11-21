@@ -196,7 +196,7 @@ Why only follow-ups: we first gave context to every message. On the board, 4 of 
    - **Chats** (`curate_chats`) are logged with no device and status `nop`. Who decides what she should have said, in order:
      1. **You:** `/good` keeps her reply. `/bad` asks for a better one from the corpus or the teacher.
      2. **The corpus,** when it covers the message. It's free and consistent with her training.
-     3. **The teacher model** (`TEACHER=claude`). `ClaudeTeacher.review_chats` judges each remaining reply and writes the one she should have given.
+     3. **The teacher model:** `TEACHER=groq` (free plan, `openai/gpt-oss-120b`, strict JSON-schema output) or `TEACHER=claude`. `LLMTeacher.review_chats` judges each remaining reply and writes the one she should have given. Groq's HTTP 429 `retry-after` is waited out, up to 90 s.
 
      With a teacher, the corpus's "I don't know that yet" doesn't count as an answer, so the teacher can teach her the fact. When a real conversation and the corpus give the same prompt different targets, the real conversation wins and the newest correction wins (`resolve_chat_conflicts`).
 2. **Synthesize.**

@@ -3,7 +3,8 @@
 RuleTeacher   deterministic, free. Uses rules the peripheral declared in its
               manifest ("rules") plus rules an operator stored in
               uart_devices.learned_rules. Unidentified devices always get NOP.
-ClaudeTeacher RuleTeacher first; when no rule decides, asks Claude (structured
+LLMTeacher    (ClaudeTeacher: Claude; OpenAICompatibleTeacher: Groq or any
+              OpenAI-compatible API) RuleTeacher first; when no rule decides, asks the model (structured
               JSON output) and keeps the answer only if it passes the device's
               manifest validation. Capped per evolution run. Also classifies
               unknown UART streams for /api/v1/uart/classify, reviews LISA's
@@ -318,56 +319,31 @@ REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 REFUSAL_FALLBACKS = [{"model": "claude-opus-4-8"}]
 
 
-class ClaudeTeacher:
-    def __init__(self, client: Any, model: str = "claude-opus-5-5", effort: str = "medium", max_calls: int = 50,
-                 min_confidence: float = 0.6) -> None:
+class LLMTeacher:
+    """What every API teacher does, given one structured-JSON call (_ask):
+    device labels (rules first), chat reviews, lessons, and UART stream classification.
+    Each call counts against max_calls per evolution run."""
+
+    def __init__(self, model: str, max_calls: int = 50, min_confidence: float = 0.6) -> None:
         self.rules = RuleTeacher()
-        self.client = client
         self.model = model
-        self.effort = effort
         self.max_calls = max_calls
         self.min_confidence = min_confidence
         self.calls = 0
         self.name = model
 
-    @classmethod
-    def from_env(cls, model: str, effort: str, max_calls: int) -> "ClaudeTeacher":
-        import anthropic   # credentials: ANTHROPIC_API_KEY, or an `ant auth login` profile
-
-        return cls(anthropic.Anthropic(), model=model, effort=effort, max_calls=max_calls)
-
     def reset_budget(self) -> None:
         self.calls = 0
 
+    def _take_call(self) -> bool:
+        if self.calls >= self.max_calls:
+            return False
+        self.calls += 1
+        return True
+
     def _ask(self, system: str, user: str, schema: dict[str, Any]) -> str | None:
         """One structured-output request. Returns the JSON text, or None on any failure."""
-        import anthropic
-
-        if self.calls >= self.max_calls:
-            return None
-        self.calls += 1
-        try:
-            response = self.client.beta.messages.create(
-                model=self.model,
-                max_tokens=16000,
-                betas=[REFUSAL_FALLBACK_BETA],
-                fallbacks=REFUSAL_FALLBACKS,
-                output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": schema}},
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-        except anthropic.RateLimitError:
-            log.warning("Claude teacher rate-limited; skipping this label")
-            return None
-        except anthropic.APIStatusError as e:
-            log.warning("Claude teacher API error %s: %s", e.status_code, e.message)
-            return None
-        except anthropic.APIConnectionError:
-            log.warning("Claude teacher could not reach the API")
-            return None
-        if response.stop_reason == "refusal":
-            return None
-        return next((b.text for b in response.content if b.type == "text"), None)
+        raise NotImplementedError
 
     def label(self, dev: DeviceContext, event: str) -> Label | None:
         ruled = self.rules.label(dev, event)
@@ -394,7 +370,7 @@ class ClaudeTeacher:
         return Label(target, self.name, d.confidence) if verdict == "ok" and target else None
 
     def review_chats(self, turns: list[ChatTurn], batch: int = 20) -> list[ChatReview | None]:
-        """One review per turn (None where Claude gave none, or an unusable one)."""
+        """One review per turn (None where the model gave none, or an unusable one)."""
         out: list[ChatReview | None] = [None] * len(turns)
         for start in range(0, len(turns), batch):
             chunk = turns[start:start + batch]
@@ -418,7 +394,7 @@ class ClaudeTeacher:
         """Up to n new topics to teach, each with phrasings and LISA's reply."""
         if n <= 0:
             return []
-        user = (f"Teach LISA {n} new topics. She already knows: {', '.join(known_topics)}.")
+        user = f"Teach LISA {n} new topics. She already knows: {', '.join(known_topics)}."
         text = self._ask(LESSONS_SYSTEM, user, LESSONS_SCHEMA)
         if text is None:
             return []
@@ -443,3 +419,109 @@ class ClaudeTeacher:
             return StreamClassification.model_validate_json(text)
         except ValidationError:
             return None
+
+
+class ClaudeTeacher(LLMTeacher):
+    """Claude through the Anthropic API (ANTHROPIC_API_KEY)."""
+
+    def __init__(self, client: Any, model: str = "claude-opus-5-5", effort: str = "medium", max_calls: int = 50,
+                 min_confidence: float = 0.6) -> None:
+        super().__init__(model, max_calls, min_confidence)
+        self.client = client
+        self.effort = effort
+
+    @classmethod
+    def from_env(cls, model: str, effort: str, max_calls: int) -> "ClaudeTeacher":
+        import anthropic   # credentials: ANTHROPIC_API_KEY, or an `ant auth login` profile
+
+        return cls(anthropic.Anthropic(), model=model, effort=effort, max_calls=max_calls)
+
+    def _ask(self, system: str, user: str, schema: dict[str, Any]) -> str | None:
+        import anthropic
+
+        if not self._take_call():
+            return None
+        try:
+            response = self.client.beta.messages.create(
+                model=self.model,
+                max_tokens=16000,
+                betas=[REFUSAL_FALLBACK_BETA],
+                fallbacks=REFUSAL_FALLBACKS,
+                output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": schema}},
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+        except anthropic.RateLimitError:
+            log.warning("Claude teacher rate-limited; skipping this label")
+            return None
+        except anthropic.APIStatusError as e:
+            log.warning("Claude teacher API error %s: %s", e.status_code, e.message)
+            return None
+        except anthropic.APIConnectionError:
+            log.warning("Claude teacher could not reach the API")
+            return None
+        if response.stop_reason == "refusal":
+            return None
+        return next((b.text for b in response.content if b.type == "text"), None)
+
+
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"   # production model with strict JSON-schema outputs on Groq
+
+
+class OpenAICompatibleTeacher(LLMTeacher):
+    """Any OpenAI-compatible chat-completions API with strict JSON-schema outputs; Groq by default
+    (GROQ_API_KEY, free plan with rate limits). On HTTP 429 it waits out `retry-after` (up to
+    max_wait_s) and retries, so a burst of calls in one evolution run doesn't lose reviews."""
+
+    def __init__(self, api_key: str, model: str = GROQ_DEFAULT_MODEL, base_url: str = GROQ_BASE_URL,
+                 max_calls: int = 50, min_confidence: float = 0.6, http: Any = None, max_wait_s: float = 90.0,
+                 sleep: Any = None) -> None:
+        import time
+
+        import httpx
+
+        super().__init__(model, max_calls, min_confidence)
+        self.name = f"groq/{model}" if base_url == GROQ_BASE_URL else model
+        self.base_url = base_url.rstrip("/")
+        self.http = http or httpx.Client(headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
+        self.max_wait_s = max_wait_s
+        self.sleep = sleep or time.sleep
+
+    def _ask(self, system: str, user: str, schema: dict[str, Any]) -> str | None:
+        import httpx
+
+        if not self._take_call():
+            return None
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "response_format": {"type": "json_schema",
+                                "json_schema": {"name": "lisa_teacher", "strict": True, "schema": schema}},
+        }
+        for _attempt in range(4):
+            try:
+                r = self.http.post(f"{self.base_url}/chat/completions", json=body)
+            except httpx.TransportError as e:
+                log.warning("Teacher %s could not reach the API: %s", self.name, e)
+                return None
+            if r.status_code == 429:
+                try:
+                    wait = float(r.headers.get("retry-after", "10"))
+                except ValueError:
+                    wait = 10.0
+                if wait > self.max_wait_s:
+                    log.warning("Teacher %s rate-limited for %.0f s; skipping", self.name, wait)
+                    return None
+                log.info("Teacher %s rate-limited; waiting %.0f s", self.name, wait)
+                self.sleep(wait + 0.5)
+                continue
+            if r.status_code != 200:
+                log.warning("Teacher %s API error %s: %s", self.name, r.status_code, r.text[:300])
+                return None
+            try:
+                return r.json()["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError, ValueError):
+                log.warning("Teacher %s returned an unexpected response", self.name)
+                return None
+        return None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, status
 
-from ..evolution.teacher import ClaudeTeacher
+from ..evolution.teacher import LLMTeacher
 from ..ingest import ingest_telemetry
 from ..schemas import ClassifyRequest, ClassifyResponse, OtaCheckResponse, TelemetryAck, TelemetryBatch
 from ..security import Ctx, Node
@@ -28,7 +28,7 @@ def classify(req: ClassifyRequest, node: Node, ctx: Ctx) -> ClassifyResponse:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "node_id doesn't match the authenticated node")
     sample = bytes.fromhex(req.sample_hex) if len(req.sample_hex) % 2 == 0 else b""
     result = analyze_stream(sample).as_dict()
-    if result["confidence"] < 0.7 and isinstance(ctx.teacher, ClaudeTeacher):
+    if result["confidence"] < 0.7 and isinstance(ctx.teacher, LLMTeacher):
         llm = ctx.teacher.classify_stream(sample, req.baud, req.format_guess)
         if llm is not None and llm.confidence > result["confidence"]:
             result = {**llm.model_dump(), "source": ctx.teacher.model}

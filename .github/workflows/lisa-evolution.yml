@@ -7,6 +7,7 @@
 #   SUPABASE_URL                https://<project-ref>.supabase.co
 #   SUPABASE_SERVICE_ROLE_KEY   Supabase service_role key
 #   OTA_SIGNING_KEY_PEM         the same private key as Render's OTA_SIGNING_KEY_PEM
+#   GROQ_API_KEY                optional, only with repository variable TEACHER=groq (free plan)
 #   ANTHROPIC_API_KEY           optional, only with repository variable TEACHER=claude
 #
 # Logs of public repositories are public. The worker never prints secrets.
@@ -74,6 +75,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TEACHER: ${{ vars.TEACHER || 'rule' }}
           TRAINER: torch
           # The worker serves no HTTP, so it needs no shared admin token; any

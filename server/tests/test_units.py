@@ -369,3 +369,53 @@ def test_chat_logs_are_curated_by_you_then_the_corpus_then_the_teacher():
     assert rows[4]["target_response"] == "I like pizza!" and rows[4]["teacher"] == "user"
     assert rows[5]["target_response"] == joke and rows[5]["prompt"].startswith("<l>")
     assert stats["chat_real_log"] == 2 and stats["chat_failure_recovery"] == 3 and len(stats["chat_review"]) == 5
+
+
+def test_groq_teacher_reviews_chats_and_waits_out_rate_limits():
+    import json
+
+    import httpx
+
+    from app.evolution.teacher import GROQ_DEFAULT_MODEL, ChatTurn, OpenAICompatibleTeacher
+
+    review = {"reviews": [{"index": 0, "verdict": "bad", "better_reply": "I can't eat, but pizza sounds fun!",
+                           "confidence": 0.9}]}
+    replies = [httpx.Response(429, headers={"retry-after": "3"}, json={"error": "rate limited"}),
+               httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(review)}}]}),
+               httpx.Response(400, json={"error": {"message": "Generated JSON does not match the expected schema."}})]
+    seen, slept = [], []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return replies.pop(0)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), headers={"Authorization": "Bearer gsk_test"})
+    t = OpenAICompatibleTeacher("gsk_test", http=http, sleep=slept.append)
+    out = t.review_chats([ChatTurn(None, "do you like pizza", "I don't have pets.")])
+    assert out[0].better_reply == "I can't eat, but pizza sounds fun!" and slept == [3.5]
+    body = json.loads(seen[0].content)
+    assert str(seen[0].url) == "https://api.groq.com/openai/v1/chat/completions"
+    assert seen[0].headers["authorization"] == "Bearer gsk_test"
+    assert body["model"] == GROQ_DEFAULT_MODEL and body["messages"][0]["role"] == "system"
+    rf = body["response_format"]
+    assert rf["type"] == "json_schema" and rf["json_schema"]["strict"] is True
+    assert rf["json_schema"]["schema"]["required"] == ["reviews"]
+    assert t.lessons(3, ["greet"]) == [] and t.calls == 2          # 400 -> no lessons, budget counted once each
+    assert t.name == f"groq/{GROQ_DEFAULT_MODEL}"
+
+
+def test_groq_teacher_config():
+    import pytest as _pytest
+
+    from app.config import Settings
+    from app.evolution.pipeline import make_teacher
+    from app.evolution.teacher import OpenAICompatibleTeacher
+
+    with _pytest.raises(ValueError, match="GROQ_API_KEY"):
+        Settings(_env_file=None, teacher="groq")
+    with _pytest.raises(ValueError, match="GROQ_API_KEY"):
+        Settings(_env_file=None, teacher="groq", groq_api_key="")      # unset GitHub secret
+    t = make_teacher(Settings(_env_file=None, teacher="groq", groq_api_key="gsk_x"))
+    assert isinstance(t, OpenAICompatibleTeacher) and t.model == "openai/gpt-oss-120b"
+    t = make_teacher(Settings(_env_file=None, teacher="groq", groq_api_key="gsk_x", teacher_model="openai/gpt-oss-20b"))
+    assert t.model == "openai/gpt-oss-20b"

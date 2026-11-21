@@ -81,12 +81,16 @@ Every chat is logged. At each training run (`cd server && python worker.py --onc
 
 Right answers are kept; wrong ones are replaced by the answer she should have given. The new model must beat the old one before it's sent to the board.
 
-To turn the teacher on, add to `server/.env` (and as GitHub repository secret `ANTHROPIC_API_KEY` plus variable `TEACHER=claude` for the scheduled runs):
-```
-TEACHER=claude
-ANTHROPIC_API_KEY=<your key from console.anthropic.com>
-```
-Each run makes at most `TEACHER_MAX_CALLS_PER_RUN` (default 50) API calls; one call reviews up to 20 chats.
+To turn the teacher on, add one of these to `server/.env`:
+
+| Teacher | `server/.env` | Cost |
+|---|---|---|
+| **Groq** (open model `openai/gpt-oss-120b`) | `TEACHER=groq`<br>`GROQ_API_KEY=<key from console.groq.com → API Keys>` | Free plan, rate-limited |
+| **Claude** (`claude-opus-5-5`) | `TEACHER=claude`<br>`ANTHROPIC_API_KEY=<key from console.anthropic.com>` | Paid API credits |
+
+For the scheduled GitHub runs, add the key as a repository secret (`GROQ_API_KEY` or `ANTHROPIC_API_KEY`) and set repository variable `TEACHER` to `groq` or `claude`.
+
+Each run makes at most `TEACHER_MAX_CALLS_PER_RUN` (default 50) API calls: one call reviews up to 20 chats, and one writes new topics. When Groq's rate limit is hit, the teacher waits the time Groq asks for and retries. `TEACHER_MODEL` overrides the model, for example `openai/gpt-oss-20b`.
 
 ## Tests
 

@@ -40,8 +40,10 @@ class Settings(BaseSettings):
     trainer: Literal["mock", "torch", "remote"] = "mock"
     remote_trainer_url: str | None = None
     remote_trainer_token: SecretStr | None = None
-    teacher: Literal["rule", "claude"] = "rule"
-    teacher_model: str = "claude-opus-5-5"
+    teacher: Literal["rule", "claude", "groq"] = "rule"
+    teacher_model: str | None = None                   # default: claude-opus-5-5 / openai/gpt-oss-120b (groq)
+    groq_api_key: SecretStr | None = None              # TEACHER=groq (free plan at console.groq.com)
+    teacher_base_url: str = "https://api.groq.com/openai/v1"   # TEACHER=groq: any OpenAI-compatible API
     teacher_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
     teacher_max_calls_per_run: int = 50
     run_evolution_inline: bool | None = None           # None: inline in dev mode, worker otherwise
@@ -80,6 +82,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _production_guards(self) -> "Settings":
+        if self.teacher == "groq" and not (self.groq_api_key and self.groq_api_key.get_secret_value()):
+            raise ValueError("TEACHER=groq needs GROQ_API_KEY (create one at console.groq.com -> API Keys)")
         if not self.dev_mode:
             if self.supabase_service_role_key is None:
                 raise ValueError("SUPABASE_SERVICE_ROLE_KEY is required when SUPABASE_URL is set")

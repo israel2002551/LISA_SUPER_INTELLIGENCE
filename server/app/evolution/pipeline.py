@@ -28,7 +28,8 @@ from .model_spec import BASE_MODEL, QUANTIZATION_FORMAT, SPEC
 from .signing import ManifestSigner
 from .chat_corpus import chat_rows, known_topics, lesson_rows
 from .synth import synthesize
-from .teacher import ClaudeTeacher, DeviceContext, RuleTeacher, Teacher
+from .teacher import (GROQ_DEFAULT_MODEL, ClaudeTeacher, DeviceContext, LLMTeacher, OpenAICompatibleTeacher,
+                      RuleTeacher, Teacher)
 from .tokenizer import BpeTokenizer
 from .trainer import Example, TrainConfig, make_trainer
 
@@ -74,7 +75,13 @@ class EvolutionContext:
 
 def make_teacher(settings: Settings) -> Teacher:
     if settings.teacher == "claude":
-        return ClaudeTeacher.from_env(settings.teacher_model, settings.teacher_effort, settings.teacher_max_calls_per_run)
+        return ClaudeTeacher.from_env(settings.teacher_model or "claude-opus-5-5", settings.teacher_effort,
+                                      settings.teacher_max_calls_per_run)
+    if settings.teacher == "groq" and settings.groq_api_key and settings.groq_api_key.get_secret_value():
+        return OpenAICompatibleTeacher(settings.groq_api_key.get_secret_value(),
+                                       model=settings.teacher_model or GROQ_DEFAULT_MODEL,
+                                       base_url=settings.teacher_base_url,
+                                       max_calls=settings.teacher_max_calls_per_run)
     return RuleTeacher()
 
 
@@ -184,7 +191,7 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
     repo.update_run(run_id, {"status": "running", "started_at": _now()})
     stats: dict[str, Any] = {}
     try:
-        if isinstance(ctx.teacher, ClaudeTeacher):
+        if isinstance(ctx.teacher, LLMTeacher):
             ctx.teacher.reset_budget()
 
         # 1-2. Curate + synthesize

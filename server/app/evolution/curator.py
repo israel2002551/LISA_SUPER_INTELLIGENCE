@@ -54,7 +54,7 @@ def curate_chats(logs: list[dict[str, Any]], teacher: Teacher, stats: dict[str, 
     """Chat logs -> examples. Who decides what LISA should have said, in order:
       1. you: /good keeps her reply; /bad asks for a better one (below)
       2. the corpus, when it covers the message (free, and consistent with her training)
-      3. the teacher model (ClaudeTeacher.review_chats), for everything else
+      3. the teacher model (LLMTeacher.review_chats: Claude or Groq), for everything else
     A reply nobody can judge is skipped. With a teacher, the corpus's "I don't know that
     yet" doesn't count as an answer: the teacher may know it, and then she learns it."""
     from .chat_corpus import DONT_KNOW, corpus_reply   # chat_corpus imports example_row from here
