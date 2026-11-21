@@ -72,6 +72,7 @@ ACTION_MAX_TOKENS = 48            # output budget (actions and chat replies); an
 CHAT_USER_TAG = b"<u>"
 CHAT_LISA_TAG = b"<l>"
 CHAT_MAX_CHARS = 150              # bytes of user text kept
+CHAT_HISTORY_MAX_BYTES = 160      # her previous reply is prepended only if the whole prompt fits this
 
 QUANTIZATION_FORMAT = "q16_rowscale_tied"
 BASE_MODEL = "lisa-gemma4-int16-h256-l2-v4096"

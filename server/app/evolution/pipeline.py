@@ -26,7 +26,7 @@ from .curator import curate
 from .delta import build_delta, changed_blocks
 from .model_spec import BASE_MODEL, QUANTIZATION_FORMAT, SPEC
 from .signing import ManifestSigner
-from .chat_corpus import chat_rows
+from .chat_corpus import chat_rows, known_topics, lesson_rows
 from .synth import synthesize
 from .teacher import ClaudeTeacher, DeviceContext, RuleTeacher, Teacher
 from .tokenizer import BpeTokenizer
@@ -194,6 +194,8 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
         stats["synthetic_inserted"] = repo.insert_examples(synth_rows)
         if s.chat_enabled:
             stats["chat_inserted"] = repo.insert_examples(chat_rows())   # stable corpus: re-runs add nothing
+            if hasattr(ctx.teacher, "lessons") and s.teacher_lessons_per_run > 0:
+                stats["lessons"] = teach_lessons(ctx, s.teacher_lessons_per_run)
 
         manifests = {d.key: d.manifest for d in devices}
 
@@ -202,8 +204,8 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
             task = (r.get("context_json") or {}).get("task", "action")
             return Example(r["prompt"].encode("utf-8"), r["target_response"], manifests.get(key, {}), task)
 
-        train = [to_example(r) for r in repo.list_examples("train")]
-        val = [to_example(r) for r in repo.list_examples("val")]
+        train = [to_example(r) for r in resolve_chat_conflicts(repo.list_examples("train"))]
+        val = [to_example(r) for r in resolve_chat_conflicts(repo.list_examples("val"))]
         stats.update(n_train=len(train), n_val=len(val))
         if len(train) < s.min_train_examples and not force:
             return _finish(ctx, run_id, "rejected", stats, f"only {len(train)} training examples (< {s.min_train_examples})")
@@ -258,6 +260,35 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
         log.exception("evolution run %s failed", run_id)
         stats["traceback"] = traceback.format_exc()[-2000:]
         return _finish(ctx, run_id, "failed", stats, f"{type(e).__name__}: {e}")
+
+
+def resolve_chat_conflicts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One target per chat prompt. Lessons from real conversations (you, the teacher model)
+    beat the built-in corpus, and the newest one wins, so a correction replaces what came
+    before instead of fighting it. Device examples are left alone."""
+    best: dict[str, dict[str, Any]] = {}
+    out = []
+    for r in rows:
+        if (r.get("context_json") or {}).get("task") != "chat":
+            out.append(r)
+            continue
+        rank = (r.get("source_log_id") is not None, r.get("id") or 0)
+        cur = best.get(r["prompt"])
+        if cur is None or rank > (cur.get("source_log_id") is not None, cur.get("id") or 0):
+            best[r["prompt"]] = r
+    return out + list(best.values())
+
+
+def teach_lessons(ctx: EvolutionContext, n: int) -> dict[str, Any]:
+    """The teacher model picks n topics LISA doesn't know yet and writes them as training examples."""
+    taught = {(r.get("context_json") or {}).get("intent", "") for r in ctx.repo.list_examples()}
+    known = known_topics() + sorted(i.removeprefix("lesson:") for i in taught if i.startswith("lesson:"))
+    lessons = ctx.teacher.lessons(n, known)
+    rows = [row for l in lessons for row in lesson_rows(l.topic, l.phrasings, l.reply, ctx.teacher.name)]
+    for l in lessons:
+        log.info("lesson %r: %r -> %r", l.topic, l.phrasings[0], l.reply)
+    return {"topics": [{"topic": l.topic, "ask": l.phrasings[0], "reply": l.reply} for l in lessons],
+            "inserted": ctx.repo.insert_examples(rows)}
 
 
 def _finish(ctx: EvolutionContext, run_id: str, status: str, stats: dict[str, Any], error: str | None) -> dict[str, Any]:

@@ -155,7 +155,13 @@ output = greedy decode, up to 48 tokens, first line
 - **Each image records its tokenizer** with `W25_MODEL_FLAG_TOK_LISA`. The firmware and the server use the matching one, so models v1–v3 keep their byte tokens.
 - **Why it was needed:** the first 4096 entries of the Llama tokenizer (`tokenizer.bin`) contain no single characters. Every character fell back to a byte token, and no merge ever happened. The new vocabulary needs 2–2.4× fewer tokens for the same text.
 
-**Chat.** Anything typed on the USB console that isn't a `/command` is a chat message (`/ask <text>` also works).
+**Memory.** For follow-ups only (`FOLLOWUPS` in `prompt_format.py`, the same list in `edge/action_schema.h`: "say that again", "tell me more", "why", ...), her last reply is prepended: `"<l>" + reply + "<u>" + text + "<l>"`, if that fits 160 bytes. It expires after 10 minutes or on `/new`. The corpus trains "say that again" (repeat it) and "tell me more" (per-topic follow-ups) after each answer.
+
+Why only follow-ups: we first gave context to every message. On the board, 4 of 12 ordinary questions then got her previous reply copied back (`who are you?` → her "how are you" answer), and the gate missed it because it sampled the oldest validation rows. Now:
+- every other message is single-turn;
+- the gate samples each task's validation set with a stable shuffle.
+
+**Chat.** Anything typed on the USB console that isn't a `/command` is a chat message (`/ask <text>` also works). `/good` and `/bad` rate her last reply.
 - **Corpus:** `server/app/evolution/chat_corpus.py` holds about 80 intents. Each has many phrasings and one reply; out-of-scope questions get "I don't know that yet".
 - **Variants:** each phrasing is expanded with case, punctuation and "lisa, ..." forms.
 - **Validation:** whole phrasings are held out for validation, so the score measures understanding of new wordings.
@@ -187,9 +193,16 @@ output = greedy decode, up to 48 tokens, first line
    - **Reward from outcomes:** `ok` 1.0, `timeout` 0.3, `rejected` 0.1, `invalid_output` 0.0. Peripheral feedback overrides this.
    - **Rule match:** a matching rule (from the device manifest or an operator's `learned_rules`) beats the hardware outcome.
    - **No rule:** where no rule applies, a well-rewarded real outcome wins. That's how the model learns behavior beyond its rules.
+   - **Chats** (`curate_chats`) are logged with no device and status `nop`. Who decides what she should have said, in order:
+     1. **You:** `/good` keeps her reply. `/bad` asks for a better one from the corpus or the teacher.
+     2. **The corpus,** when it covers the message. It's free and consistent with her training.
+     3. **The teacher model** (`TEACHER=claude`). `ClaudeTeacher.review_chats` judges each remaining reply and writes the one she should have given.
+
+     With a teacher, the corpus's "I don't know that yet" doesn't count as an answer, so the teacher can teach her the fact. When a real conversation and the corpus give the same prompt different targets, the real conversation wins and the newest correction wins (`resolve_chat_conflicts`).
 2. **Synthesize.**
    - **Threshold sweeps:** events swept around each rule's threshold, where a small model is most likely wrong.
    - **Safety examples:** NOP for events no rule covers, and for raw devices.
+   - **Chat:** the corpus, plus `TEACHER_LESSONS_PER_RUN` new topics written by the teacher model (`teach_lessons`; one API call per run).
 3. **Train.**
    - `TorchTrainer` fine-tunes the exact firmware architecture on CPU (full or LoRA, merged).
    - The token table is frozen by default, which saves ~2 MiB per OTA delta.
@@ -231,7 +244,12 @@ It also helps `/uart/classify` when the heuristics aren't confident.
   - **On the board:** a 14-turn scripted conversation got 14/14 replies right, at 2.3–5.6 s per reply.
   - **Thermostat after chat training:** still 24/24; a fan command now takes ~5 s instead of 9–10 s.
   - **Calibration, held-out chat scores:** frozen embeddings gave 0.45 but sometimes blended replies into nonsense; trainable embeddings gave 0.43 with always-whole replies; lr 2e-3 gave 0.35; 6000 steps gave 0.41 (memorizes).
-  - **Known limit:** each message is answered on its own (no memory of earlier turns). Unusual wordings get a coherent reply that is right about 40 % of the time.
+  - **Known limit:** unusual wordings get a coherent reply that is right about 40 % of the time.
+- **Learning from conversation (v5):** the first chat-curation run took 7 logged turns.
+  - **Kept** 2 (her lessons agreed). **Corrected** 4: 3 by her lessons and 1 by a `/bad`.
+  - **Skipped** 1 ("do you like pizza": needs the teacher model).
+  - **Training:** fine-tuned from v4 for 3000 steps with frozen embeddings, published as a 3.4 MB delta.
+  - **On the board:** 12/14 in a scripted conversation with follow-ups. It fixed "what is your favorite food" (wrong on v4). "say that again" and "tell me more" work after jokes and about herself. Thermostat 12/12.
 - **OTA:** the v2→v3 delta was 3.4 MB of a 5.5 MB image. Erasing the 5.4 MB staging area took 14.8 s, longer than the 5 s task watchdog, so erase, patch and verify feed the watchdog from the net task (`edge/wdt_scope.h`). Model load from the W25Q into PSRAM takes 2.2 s.
 
 Not yet measured on hardware: a physical UART peripheral (only the simulator so far) and ESP-NOW/TCP links.

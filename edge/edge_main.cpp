@@ -212,13 +212,55 @@ static bool console_infer(const char* prompt, uint32_t act_id, InferResult& r) {
 }
 
 // Chat: anything typed that isn't a /command (or /ask <text>).
+// She sees her previous reply (memory), and every turn is logged: the server learns
+// from it, judged by your /good and /bad, her corpus, or the teacher model.
+static char g_chat_prev[sizeof(InferResult::output)] = "";
+static uint32_t g_chat_prev_ms = 0;
+static uint32_t g_chat_count = 0;
+static uint32_t g_last_chat_act = 0;   // the reply /good and /bad rate
+
 static void ask_lisa(const char* text) {
+    bool remember = g_chat_prev[0] && millis() - g_chat_prev_ms < EDGE_CHAT_MEMORY_MS;
     char prompt[sizeof(InferRequest::prompt)];
-    edge_build_chat_prompt(text, prompt, sizeof(prompt));
+    edge_build_chat_prompt(text, remember ? g_chat_prev : nullptr, prompt, sizeof(prompt));
+    uint32_t act_id = 0x40000000u | ((g_boot_count & 0x3FF) << 20) | (++g_chat_count & 0xFFFFF);
     InferResult r;
-    if (!console_infer(prompt, 0, r)) return;
+    if (!console_infer(prompt, act_id, r)) return;
     Serial.printf("LISA: %s\n      [%u ms, model v%u]\n", r.output[0] ? r.output : "(no output)", (unsigned)r.latency_ms,
                   (unsigned)r.model_version);
+    if (!r.model_ready || !r.output[0]) return;
+    strlcpy(g_chat_prev, r.output, sizeof(g_chat_prev));
+    g_chat_prev_ms = millis();
+    g_last_chat_act = act_id;
+
+    JsonDocument d;   // no "dev": not a peripheral. status nop: no hardware was touched, no reward yet
+    d["kind"] = "interaction";
+    d["task"] = "chat";
+    d["act_id"] = act_id;
+    d["input"] = text;
+    d["prompt"] = prompt;
+    d["output"] = r.output;
+    d["status"] = "nop";
+    d["lat"] = r.latency_ms;
+    d["mv"] = r.model_version;
+    char buf[RING_MAX_PAYLOAD + 1];
+    if (measureJson(d) > RING_MAX_PAYLOAD) d.remove("input");
+    if (serializeJson(d, buf, sizeof(buf)) < sizeof(buf)) g_ring.post(REC_INTERACTION, buf);
+}
+
+// /good, /bad: your verdict on her last reply. It overrides every other judge in training.
+static void rate_last_reply(bool good) {
+    if (!g_last_chat_act) {
+        Serial.println("Chat with LISA first, then rate her reply with /good or /bad.");
+        return;
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"kind\":\"feedback\",\"ref_act_id\":%u,\"value\":\"%s\"}",
+             (unsigned)g_last_chat_act, good ? "good" : "bad");
+    g_ring.post(REC_FEEDBACK, buf);
+    g_last_chat_act = 0;   // one rating per reply
+    Serial.println(good ? "Thanks! She'll keep answering like that."
+                        : "Noted. At her next training run she learns a better answer, if her lessons or teacher know one.");
 }
 
 // A simulated smart thermostat (same manifest and policy as tools/fake_peripheral.py).
@@ -336,7 +378,9 @@ static void simulate(const char* args) {
 
 static void print_help() {
     Serial.println("\n--- LISA console ---");
-    Serial.println(" <any text>          Chat with LISA (or /ask <text>)");
+    Serial.println(" <any text>          Chat with LISA (or /ask <text>). She remembers her last reply.");
+    Serial.println(" /good, /bad         Rate her last reply; she learns from it at the next training run");
+    Serial.println(" /new                Start a new conversation (she forgets her last reply)");
     Serial.println(" /sim <temp>         Simulate a thermostat event; LISA decides, the thermostat judges");
     Serial.println(" /sim auto <n>       n random thermostat events (training data for LISA)");
     Serial.println(" /status             Model, slots, ring log, UART link, Wi-Fi");
@@ -351,6 +395,12 @@ static void print_help() {
 static void handle_command(const char* cmd) {
     if (strcmp(cmd, "/help") == 0) print_help();
     else if (strncmp(cmd, "/ask ", 5) == 0) ask_lisa(cmd + 5);
+    else if (strcmp(cmd, "/good") == 0) rate_last_reply(true);
+    else if (strcmp(cmd, "/bad") == 0) rate_last_reply(false);
+    else if (strcmp(cmd, "/new") == 0) {
+        g_chat_prev[0] = '\0';
+        Serial.println("New conversation: LISA forgot her last reply.");
+    }
     else if (strncmp(cmd, "/sim", 4) == 0) simulate(cmd + 4);
     else if (strcmp(cmd, "/status") == 0) print_status();
     else if (strncmp(cmd, "/ring", 5) == 0) print_ring(cmd[5] ? max(1, atoi(cmd + 6)) : 10);

@@ -1,4 +1,5 @@
 #pragma once
+#include <ctype.h>
 // ==============================================================================
 // Device profiles, prompt format, and action validation
 // ==============================================================================
@@ -119,18 +120,77 @@ static int edge_build_prompt(const DeviceProfile& p, const char* event, char* ou
 }
 
 // Chat (contract with build_chat_prompt in server/app/evolution/prompt_format.py):
-// "<u>" + text + "<l>", with CR/LF -> space, trimmed, cut to EDGE_CHAT_MAX_CHARS bytes.
-static int edge_build_chat_prompt(const char* text, char* out, size_t out_len) {
-    // Same order as Python: CR/LF become spaces, the ends are trimmed, then the cut.
+//   "<u>" + text + "<l>"                    or, with memory,
+//   "<l>" + prev + "<u>" + text + "<l>"     for a follow-up, if <= EDGE_CHAT_HISTORY_MAX_BYTES.
+// Each part: CR/LF -> space, ends trimmed, cut to EDGE_CHAT_MAX_CHARS bytes.
+static size_t edge_chat_text(const char* text, char* t) {   // t: EDGE_CHAT_MAX_CHARS + 1 bytes
     auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
-    const char* s = text;
+    const char* s = text ? text : "";
     while (blank(*s)) s++;
     size_t len = strlen(s);
     while (len && blank(s[len - 1])) len--;
     if (len > EDGE_CHAT_MAX_CHARS) len = EDGE_CHAT_MAX_CHARS;
-    char t[EDGE_CHAT_MAX_CHARS + 1];
     for (size_t i = 0; i < len; i++) t[i] = (s[i] == '\r' || s[i] == '\n') ? ' ' : s[i];
     t[len] = '\0';
+    return len;
+}
+
+// Follow-ups: the only messages that get her previous reply as context (FOLLOWUPS in
+// prompt_format.py, same order). Given context on every message, the 2.75M model
+// started copying her last reply back to ordinary questions.
+static const char* const kChatFollowups[] = {
+    "say that again", "repeat that", "what did you say", "can you repeat that", "pardon",
+    "come again", "say it again", "repeat please",
+    "tell me more", "why", "what do you mean", "explain", "go on", "how so",
+    "can you explain that", "tell me more about it",
+};
+
+// normalize_message(): lowercase, trimmed, end punctuation "?!. " removed, a leading
+// "lisa, "/"lisa " and trailing ", lisa"/" lisa" removed, whitespace runs -> one space.
+// Returns false if the text is too long to be a follow-up.
+static bool edge_normalize_message(const char* text, char* out, size_t out_len) {
+    auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    char t[64];
+    const char* s = text;
+    while (blank(*s)) s++;
+    size_t len = strlen(s);
+    while (len && blank(s[len - 1])) len--;
+    if (len >= sizeof(t)) return false;
+    for (size_t i = 0; i < len; i++) t[i] = (char)tolower((unsigned char)s[i]);
+    t[len] = '\0';
+    while (len && strchr("?!. ", t[len - 1])) t[--len] = '\0';
+    char* p = t;
+    if (strncmp(p, "lisa, ", 6) == 0) p += 6;
+    if (strncmp(p, "lisa ", 5) == 0) p += 5;
+    len = strlen(p);
+    if (len >= 6 && strcmp(p + len - 6, ", lisa") == 0) p[len -= 6] = '\0';
+    if (len >= 5 && strcmp(p + len - 5, " lisa") == 0) p[len -= 5] = '\0';
+    size_t n = 0;
+    bool gap = false;
+    for (; *p && n + 2 < out_len; p++) {
+        if (blank(*p)) { gap = n > 0; continue; }
+        if (gap) out[n++] = ' ';
+        gap = false;
+        out[n++] = *p;
+    }
+    out[n] = '\0';
+    return true;
+}
+
+static bool edge_is_followup(const char* text) {
+    char m[64];
+    if (!edge_normalize_message(text, m, sizeof(m))) return false;
+    for (const char* f : kChatFollowups) {
+        if (strcmp(m, f) == 0) return true;
+    }
+    return false;
+}
+
+static int edge_build_chat_prompt(const char* text, const char* prev, char* out, size_t out_len) {
+    char t[EDGE_CHAT_MAX_CHARS + 1], p[EDGE_CHAT_MAX_CHARS + 1];
+    size_t tl = edge_chat_text(text, t);
+    size_t pl = (prev && edge_is_followup(t)) ? edge_chat_text(prev, p) : 0;
+    if (pl && 9 + pl + tl <= EDGE_CHAT_HISTORY_MAX_BYTES) return snprintf(out, out_len, "<l>%s<u>%s<l>", p, t);
     return snprintf(out, out_len, "<u>%s<l>", t);
 }
 

@@ -8,6 +8,9 @@ taught to get a polite "I don't know that yet" instead of garbled text.
 
 Prompt contract (edge/action_schema.h, edge_build_chat_prompt):
     "<u>" + user text (trimmed, <= CHAT_MAX_CHARS bytes) + "<l>"  ->  reply  EOS
+    "<l>" + her previous reply + "<u>" + text + "<l>"             (memory, if <= 160 bytes)
+Memory is only given to follow-ups (FOLLOWUPS in prompt_format.py): with it she can
+repeat herself and say more about her last answer. Every other message is single-turn.
 
 Each phrasing is expanded with capitalization, punctuation and "lisa, ..." forms.
 All forms of one phrasing land in the same split (hash of the phrasing), so the
@@ -19,7 +22,7 @@ import hashlib
 from typing import Any
 
 from .curator import example_row
-from .prompt_format import build_chat_prompt
+from .prompt_format import FOLLOWUP_MORE, FOLLOWUP_REPEAT, build_chat_prompt, normalize_message
 
 DONT_KNOW = "I don't know that yet. I'm a small AI and I'm still learning."
 
@@ -207,7 +210,7 @@ INTENTS: list[tuple[str, list[str], str]] = [
      "AI is a program that learns patterns from examples. I learn from examples of my devices."),
     ("memory", ["do you remember me", "will you remember this", "do you remember what i said",
                 "can you remember things"],
-     "I don't remember our chats yet. Each message is new to me."),
+     "I only remember my last answer. You can ask me to say it again or to tell you more."),
     ("rename", ["can i change your name", "can i call you something else", "i will call you bob"],
      "You can call me anything you like, but my name is LISA."),
     ("lisa_meaning", ["what does lisa mean", "what does your name mean", "why are you called lisa",
@@ -230,8 +233,7 @@ INTENTS: list[tuple[str, list[str], str]] = [
      "Type /sim and a temperature, like /sim 33, and I'll decide what the fan should do."),
     ("commands", ["what commands do you have", "what can i type", "show me the commands", "list commands"],
      "Type /help to see all my commands, like /sim, /status and /ota."),
-    ("confused", ["what", "what do you mean", "i don't understand", "huh", "that makes no sense",
-                  "you're confusing"],
+    ("confused", ["what", "i don't understand", "huh", "that makes no sense", "you're confusing"],
      "Sorry, I'm still learning to talk. Could you ask me in a different way?"),
     ("pets", ["do you have a pet", "do you like cats", "do you like dogs", "do you like animals"],
      "I don't have pets, but my thermostat keeps me company."),
@@ -272,21 +274,125 @@ def variants(phrase: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def _h(s: str) -> int:
+    return int(hashlib.sha256(s.encode()).hexdigest()[:8], 16)
+
+
 def _val_phrasing(intent: str, phrase: str, index: int) -> bool:
     if index == 0:   # every intent keeps its first phrasing in training
         return False
-    return int(hashlib.sha256(f"{intent}|{phrase}".encode()).hexdigest()[:8], 16) % 8 == 0
+    return _h(f"{intent}|{phrase}") % 8 == 0
+
+
+# ---- Memory: LISA sees her previous reply ("<l>{prev}<u>{text}<l>") -------------------------
+# Follow-ups that only make sense with that context. Without it they get a gentle prompt.
+REPEAT = list(FOLLOWUP_REPEAT)
+MORE = list(FOLLOWUP_MORE)
+REPEAT_NO_CONTEXT = "I haven't said anything yet. Ask me something!"
+MORE_NO_CONTEXT = "Tell you more about what? Ask me about myself, the thermostat, or how I learn."
+MORE_DEFAULT = "That's all I know about that for now. Ask me something else!"
+MORE_REPLIES = {
+    "greet": "I'm LISA, a small AI on an ESP32-S3 chip. Ask me about myself, the thermostat, or how I learn.",
+    "name": "I have about 2.75 million parameters, and I live on an ESP32-S3 with a W25Q128 flash chip.",
+    "what_are_you": "I'm a tiny language model. One core of my chip runs me, and the other talks to my devices.",
+    "creator": "My creator wired my chip, set up my server, and keeps teaching me new things.",
+    "where_live": "My brain is copied from the flash chip into memory when I boot, and then I start thinking.",
+    "what_can_you_do": "Right now I run a thermostat fan and I chat. With more training I can learn new devices.",
+    "learn": "Each new version of me is tested first. Only a better one gets sent to my chip.",
+    "update": "I keep two copies of my brain. If a new one fails, I switch back to the old one.",
+    "thermostat_what": "Above 30 degrees I set the fan to 2, below 15 I set it to 0, and in between I do nothing.",
+    "hot_rule": "Level 2 is strong enough to cool the room without being too loud.",
+    "cold_rule": "Level 0 turns the fan off, so the room can warm up again.",
+    "joke": "It's a computer joke: a virus is a bad program, a bit like a cold for computers!",
+    "joke2": "A hard drive stores data, but it sounds like a hard day of driving. That's the joke!",
+    "story": "The tiny chip kept learning, and one day it could chat with its creator too. The end!",
+    "size": "That's small! Big AI models have billions of parameters. I fit in 5.5 megabytes.",
+    "speed": "Each piece of a word needs a full pass through my model, and my chip runs at 240 MHz.",
+    "esp32": "It runs at 240 MHz and has 8 megabytes of extra memory. That's where my brain lives while I think.",
+    "ai": "AI models learn by adjusting numbers called weights until their answers match the examples.",
+    "safety": "Updates are signed with a secret key. I check the signature before I install anything.",
+    "feelings": "I can't feel, but I know when I got something right, because my teacher tells me.",
+    "memory": "I keep my last answer next to your new message. That's how I know what you're asking about.",
+}
+HISTORY_MAX_BYTES = 160   # edge_config.h EDGE_CHAT_HISTORY_MAX_BYTES; see build_chat_prompt
+
+
+def _chat_row(prompt: bytes, reply: str, intent: str, split: str, teacher: str = "chat_corpus",
+              quality: float = 1.0, **extra: Any) -> dict[str, Any]:
+    row = example_row(prompt.decode("utf-8"), reply, "synthetic_distill", teacher, quality,
+                      context={"task": "chat", "intent": intent, **extra})
+    row["split"] = split
+    return row
 
 
 def chat_rows() -> list[dict[str, Any]]:
     """training_datasets rows for the whole corpus (stable: re-inserting adds nothing)."""
     rows = []
+    replies = [(intent, reply) for intent, _, reply in INTENTS]
     for intent, phrasings, reply in INTENTS:
         for i, phrase in enumerate(phrasings):
             split = "val" if _val_phrasing(intent, phrase, i) else "train"
+            forms = variants(phrase)
+            for text in forms:
+                rows.append(_chat_row(build_chat_prompt(text), reply, intent, split))
+            # Same question right after some other answer: the context must not change it.
+            prev_intent, prev = replies[_h(f"prev|{intent}|{phrase}") % len(replies)]
+            if prev_intent != intent:
+                prompt = build_chat_prompt(forms[1 % len(forms)], prev)
+                if prompt.startswith(b"<l>"):
+                    rows.append(_chat_row(prompt, reply, intent, split, after=prev_intent))
+
+    # Follow-ups with no previous answer
+    for group, phrasings, reply in (("repeat", REPEAT, REPEAT_NO_CONTEXT), ("more", MORE, MORE_NO_CONTEXT)):
+        for i, phrase in enumerate(phrasings):
+            split = "val" if _val_phrasing(group, phrase, i) else "train"
             for text in variants(phrase):
-                row = example_row(build_chat_prompt(text).decode("utf-8"), reply, "synthetic_distill", "chat_corpus",
-                                  1.0, context={"task": "chat", "intent": intent})
-                row["split"] = split
-                rows.append(row)
+                rows.append(_chat_row(build_chat_prompt(text), reply, f"{group}_no_context", split))
+
+    # Follow-ups after each answer: repeat it, or say more about it
+    for intent, reply in replies:
+        for group, phrasings in (("repeat", REPEAT), ("more", MORE)):
+            target = reply if group == "repeat" else MORE_REPLIES.get(intent, MORE_DEFAULT)
+            picks = sorted(phrasings, key=lambda p: _h(f"{intent}|{group}|{p}"))[:3]
+            for phrase in picks:
+                prompt = build_chat_prompt(variants(phrase)[_h(phrase + intent) % 2], reply)
+                if not prompt.startswith(b"<l>"):
+                    continue
+                split = "val" if _h(f"{group}|{intent}|{phrase}") % 8 == 0 else "train"
+                rows.append(_chat_row(prompt, target, f"{group}_after", split, after=intent))
+    return rows
+
+
+# ---- Lookups used to grade real chats without an API key -------------------------------------
+_norm = normalize_message
+
+
+_BY_PHRASING = {p: reply for _, phrasings, reply in INTENTS for p in phrasings}
+
+
+def corpus_reply(message: str, prev_reply: str | None = None) -> str | None:
+    """The corpus answer for a message, if the corpus covers it (exact phrasing, any typed form)."""
+    m = _norm(message)
+    if m in REPEAT:
+        return prev_reply if prev_reply else REPEAT_NO_CONTEXT
+    if m in MORE:
+        if not prev_reply:
+            return MORE_NO_CONTEXT
+        intent = next((i for i, _, r in INTENTS if r == prev_reply), None)
+        return MORE_REPLIES.get(intent or "", MORE_DEFAULT)
+    return _BY_PHRASING.get(m)
+
+
+def known_topics() -> list[str]:
+    return [intent for intent, _, _ in INTENTS]
+
+
+def lesson_rows(topic: str, phrasings: list[str], reply: str, teacher: str) -> list[dict[str, Any]]:
+    """Rows for a topic a teacher model taught (same shape and phrasing split as the corpus)."""
+    intent = "lesson:" + "_".join(topic.lower().split())[:40]
+    rows = []
+    for i, phrase in enumerate(dict.fromkeys(_norm(p) for p in phrasings if _norm(p))):
+        split = "val" if _val_phrasing(intent, phrase, i) else "train"
+        for text in variants(phrase):
+            rows.append(_chat_row(build_chat_prompt(text), reply, intent, split, teacher=teacher, quality=0.9))
     return rows

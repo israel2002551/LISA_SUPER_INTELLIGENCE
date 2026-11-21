@@ -63,12 +63,30 @@ Open a serial monitor on the board's port at **921600 baud**, with line ending *
 
 | Type | What happens |
 |---|---|
-| `hello` (any text) | Chat. She knows about 80 topics: greetings, herself, feelings, jokes, the thermostat, how she learns. |
+| `hello` (any text) | Chat. She knows about 80 topics: greetings, herself, feelings, jokes, the thermostat, how she learns. She remembers her last reply, so "say that again" and "tell me more" work. |
+| `/good`, `/bad` | Rate her last reply. At the next training run she keeps it, or learns a better one. |
+| `/new` | Start a new conversation. |
 | `/sim 33` | The simulated thermostat reports 33 °C; LISA decides what the fan does. |
 | `/sim auto 20` | 20 random temperatures, with a score. Every event becomes training data. |
 | `/status`, `/help` | Model version, slots, Wi-Fi; all commands. |
 
-She's a 2.75M-parameter model. Expect short, fixed replies on the topics she was trained on, and "I don't know that yet" elsewhere. She doesn't remember earlier messages.
+She's a 2.75M-parameter model. Expect short, fixed replies on the topics she was trained on, and "I don't know that yet" elsewhere.
+
+### Let a teacher model help her grow
+
+Every chat is logged. At each training run (`cd server && python worker.py --once --trigger`, or the scheduled GitHub Action), her replies are judged in this order:
+1. **Your `/good` or `/bad`.**
+2. **Her built-in lessons** (`server/app/evolution/chat_corpus.py`).
+3. **A teacher model**, if you turn one on. It also writes a few new topics for her each run.
+
+Right answers are kept; wrong ones are replaced by the answer she should have given. The new model must beat the old one before it's sent to the board.
+
+To turn the teacher on, add to `server/.env` (and as GitHub repository secret `ANTHROPIC_API_KEY` plus variable `TEACHER=claude` for the scheduled runs):
+```
+TEACHER=claude
+ANTHROPIC_API_KEY=<your key from console.anthropic.com>
+```
+Each run makes at most `TEACHER_MAX_CALLS_PER_RUN` (default 50) API calls; one call reviews up to 20 chats.
 
 ## Tests
 

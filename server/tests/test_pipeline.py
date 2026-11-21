@@ -29,7 +29,8 @@ def test_curation_turns_outcomes_into_examples(client, ctx):
         interaction_event(7, 33.0, '{"cmd":"set_fan","args":{"level":1}}', "ok"),    # acked, but a rule says level 2
     ])
     stats = curate(ctx.repo, ctx.teacher, 100)
-    assert stats == {"logs": 6, "real_log": 3, "failure_recovery": 2, "skipped": 1, "inserted": 5}
+    assert stats == {"logs": 6, "real_log": 3, "failure_recovery": 2, "skipped": 1, "inserted": 5,
+                     "chat_logs": 0, "chat_real_log": 0, "chat_failure_recovery": 0, "chat_skipped": 0}
     targets = {(e["source_type"], e["target_response"]) for e in ctx.repo.examples}
     assert ("real_log", '{"cmd":"set_fan","args":{"level":3}}') in targets
     assert ("failure_recovery", '{"cmd":"set_fan","args":{"level":2}}') in targets
@@ -126,3 +127,20 @@ def test_gate_refuses_a_task_regression():
     assert not ok and "action regressed" in reason
     better = {"exact_match": 0.9, "n_val": 40, "tasks": {"action": {"exact_match": 0.95}, "chat": {"exact_match": 0.85}}}
     assert gate(base, better, 0.0, False, 20, 0.05)[0]
+
+
+def test_real_conversations_beat_the_corpus_for_the_same_prompt():
+    from app.evolution.pipeline import resolve_chat_conflicts
+
+    chat = {"task": "chat"}
+    rows = [{"id": 1, "prompt": "<u>capital of france<l>", "target_response": "I don't know that yet.", "context_json": chat},
+            {"id": 9, "prompt": "<u>capital of france<l>", "target_response": "Paris.", "context_json": chat,
+             "source_log_id": 40},
+            {"id": 5, "prompt": "<u>capital of france<l>", "target_response": "Lyon.", "context_json": chat,
+             "source_log_id": 30},
+            {"id": 2, "prompt": "<u>hi<l>", "target_response": "Hello!", "context_json": chat},
+            {"id": 3, "prompt": "<d>a:b<e>{}<a>", "target_response": "NOP", "context_json": {}},
+            {"id": 4, "prompt": "<d>a:b<e>{}<a>", "target_response": "NOP", "context_json": {}}]
+    out = {(r["prompt"], r["target_response"]) for r in resolve_chat_conflicts(rows)}
+    assert out == {("<u>capital of france<l>", "Paris."), ("<u>hi<l>", "Hello!"), ("<d>a:b<e>{}<a>", "NOP")}
+    assert len(resolve_chat_conflicts(rows)) == 4          # device rows untouched

@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import hashlib
 import math
 import time
 from dataclasses import dataclass, field
@@ -118,7 +119,9 @@ class TorchTrainer:
         tasks: dict[str, dict[str, Any]] = {}
         valid = n_action = 0
         for task in sorted({ex.task for ex in val}):
-            subset = [ex for ex in val if ex.task == task][: cfg.eval_limit]
+            # A stable shuffle, so the sample covers every kind of example, not just the oldest.
+            subset = sorted((ex for ex in val if ex.task == task),
+                            key=lambda ex: hashlib.sha256(ex.prompt + ex.target.encode()).digest())[: cfg.eval_limit]
             exact = 0
             for ex in subset:
                 out = model.greedy(prompt_tokens(tok, ex.prompt), ACTION_MAX_TOKENS)

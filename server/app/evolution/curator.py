@@ -19,11 +19,14 @@ behavior beyond its rules. To forbid something, write a rule for it.
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any
 
 from ..db.base import Repository
-from .prompt_format import build_prompt, canonicalize_output
-from .teacher import DeviceContext, Teacher
+from .prompt_format import build_prompt, canonicalize_output, is_chat_prompt, split_chat_prompt
+from .teacher import ChatTurn, DeviceContext, Teacher
+
+log = logging.getLogger(__name__)
 
 REWARD_BY_STATUS = {"ok": 1.0, "timeout": 0.3, "rejected": 0.1, "invalid_output": 0.0}
 
@@ -43,11 +46,78 @@ def example_row(prompt: str, target: str, source_type: str, teacher: str, qualit
     }
 
 
-def curate(repo: Repository, teacher: Teacher, limit: int) -> dict[str, int]:
-    logs = repo.fetch_untrained_interactions(limit)
-    devices = {d["id"]: DeviceContext.from_row(d) for d in repo.list_uart_devices()}
-    stats = {"logs": len(logs), "real_log": 0, "failure_recovery": 0, "skipped": 0, "inserted": 0}
+def _is_chat(log_row: dict[str, Any]) -> bool:
+    return (log_row.get("payload") or {}).get("task") == "chat" or is_chat_prompt((log_row.get("prompt") or "").encode())
+
+
+def curate_chats(logs: list[dict[str, Any]], teacher: Teacher, stats: dict[str, Any]) -> list[dict]:
+    """Chat logs -> examples. Who decides what LISA should have said, in order:
+      1. you: /good keeps her reply; /bad asks for a better one (below)
+      2. the corpus, when it covers the message (free, and consistent with her training)
+      3. the teacher model (ClaudeTeacher.review_chats), for everything else
+    A reply nobody can judge is skipped. With a teacher, the corpus's "I don't know that
+    yet" doesn't count as an answer: the teacher may know it, and then she learns it."""
+    from .chat_corpus import DONT_KNOW, corpus_reply   # chat_corpus imports example_row from here
+
+    turns = []
+    for log_row in logs:
+        prev, msg = split_chat_prompt(log_row.get("prompt") or "")
+        turns.append(ChatTurn(prev, msg, (log_row.get("model_output") or "").strip()))
+    corpus = [corpus_reply(t.message, t.prev_reply) for t in turns]
+    can_teach = hasattr(teacher, "review_chats")
+    if can_teach:   # "I don't know that yet" is a placeholder a teacher can replace with the answer
+        corpus = [None if c == DONT_KNOW else c for c in corpus]
+    # Ask the teacher only where the corpus has no answer, or you said the corpus answer was bad.
+    ask = [i for i, (t, c, l) in enumerate(zip(turns, corpus, logs))
+           if c is None or (l.get("reward") == 0.0 and c == t.reply)]
+    reviews: dict[int, Any] = {}
+    if ask and can_teach:
+        reviews = dict(zip(ask, teacher.review_chats([turns[i] for i in ask])))
+    teacher_name = getattr(teacher, "name", "teacher")
+
     rows = []
+    for i, (log_row, t) in enumerate(zip(logs, turns)):
+        reward, review, known = log_row.get("reward"), reviews.get(i), corpus[i]
+        ctx = {"task": "chat", "intent": "log", "node_id": log_row["node_id"], "model_output": t.reply,
+               "reward": reward, "model_version": log_row.get("model_version")}
+        prompt = log_row.get("prompt") or ""
+        if reward == 1.0 and t.reply:
+            target, source, who, why = t.reply, "real_log", "user", "you said /good"
+        elif reward == 0.0:
+            better = review.better_reply if review is not None and review.better_reply != t.reply else (
+                known if known not in (None, t.reply) else None)
+            target, source, who, why = better, "failure_recovery", teacher_name if review else "chat_corpus", "you said /bad"
+        elif known is not None:
+            ok = known == t.reply
+            target, source, who, why = known, "real_log" if ok else "failure_recovery", "chat_corpus", \
+                "matches her lessons" if ok else "her lessons say otherwise"
+        elif review is not None:
+            ok = review.verdict == "good"
+            target = t.reply if ok else review.better_reply
+            source, who, why = ("real_log" if ok else "failure_recovery"), teacher_name, f"teacher: {review.verdict}"
+        else:
+            target = None
+        if not target:
+            stats["chat_skipped"] += 1
+            continue
+        rows.append(example_row(prompt, target, source, who, 1.0 if who == "user" else 0.9, context=ctx,
+                                source_log_id=log_row["id"]))
+        stats["chat_" + source] += 1
+        if len(stats["chat_review"]) < 40:
+            stats["chat_review"].append({"you": t.message[:80], "lisa": t.reply[:120], "learns": target[:120], "why": why})
+            log.info("chat %-40r LISA %r -> learns %r (%s)", t.message[:40], t.reply[:60], target[:60], why)
+    return rows
+
+
+def curate(repo: Repository, teacher: Teacher, limit: int) -> dict[str, Any]:
+    all_logs = repo.fetch_untrained_interactions(limit)
+    chat_logs = [l for l in all_logs if _is_chat(l)]
+    logs = [l for l in all_logs if not _is_chat(l)]
+    devices = {d["id"]: DeviceContext.from_row(d) for d in repo.list_uart_devices()}
+    stats: dict[str, Any] = {"logs": len(logs), "real_log": 0, "failure_recovery": 0, "skipped": 0, "inserted": 0,
+                             "chat_logs": len(chat_logs), "chat_real_log": 0, "chat_failure_recovery": 0,
+                             "chat_skipped": 0, "chat_review": []}
+    rows = curate_chats(chat_logs, teacher, stats) if chat_logs else []
     for log_row in logs:
         if log_row.get("status") == "error":            # no model loaded / link reset: no signal
             stats["skipped"] += 1
@@ -80,5 +150,7 @@ def curate(repo: Repository, teacher: Teacher, limit: int) -> dict[str, int]:
             stats["skipped"] += 1
 
     stats["inserted"] = repo.insert_examples(rows)
-    repo.mark_logs_used([l["id"] for l in logs])
+    repo.mark_logs_used([l["id"] for l in all_logs])
+    if not stats["chat_review"]:
+        del stats["chat_review"]
     return stats

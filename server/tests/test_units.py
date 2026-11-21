@@ -257,10 +257,115 @@ def test_chat_corpus_fits_the_device_and_splits_by_phrasing(tok):
     by_split = collections.Counter(r["split"] for r in rows)
     assert by_split["val"] >= 60 and by_split["train"] >= 8 * by_split["val"] // 2
     trained = {r["context_json"]["intent"] for r in rows if r["split"] == "train"}
-    assert trained == {i for i, _, _ in INTENTS}                                           # every intent learnable
+    assert trained >= {i for i, _, _ in INTENTS}                                           # every intent learnable
     # all typed forms of one phrasing share a split, so val measures unseen phrasings
     splits = collections.defaultdict(set)
     for r in rows:
+        if not r["prompt"].startswith("<u>") or r["context_json"]["intent"] not in owner.values():
+            continue
         core = r["prompt"][3:-3].lower().removeprefix("lisa, ").rstrip("?!.").removesuffix(", lisa")
         splits[(r["context_json"]["intent"], core)].add(r["split"])
     assert all(len(s) == 1 for s in splits.values())
+
+
+# ---------------- memory, chat curation, Claude teacher ----------------
+
+def test_chat_memory_prompt_and_followups(tok):
+    from app.evolution.chat_corpus import INTENTS, MORE_REPLIES, REPEAT_NO_CONTEXT, corpus_reply
+    from app.evolution.model_spec import ACTION_MAX_TOKENS
+    from app.evolution.prompt_format import build_chat_prompt, split_chat_prompt
+
+    joke = "Why did the computer go to the doctor? Because it had a virus!"
+    p = build_chat_prompt(" say that again ", joke)
+    assert p == b"<l>" + joke.encode() + b"<u>say that again<l>"
+    assert split_chat_prompt(p.decode()) == (joke, "say that again")
+    assert build_chat_prompt("hi", "x" * 150) == b"<u>hi<l>"                  # too long: no memory
+    assert build_chat_prompt("who are you?", joke) == b"<u>who are you?<l>"  # not a follow-up: no memory
+    from app.evolution.prompt_format import is_followup, normalize_message
+    assert normalize_message("  Lisa,  Tell   me MORE?! ") == "tell me more" and is_followup("WHY, lisa?")
+    assert not is_followup("why is the sky blue")
+    assert corpus_reply("Say that again, lisa!", joke) == joke
+    assert corpus_reply("say that again") == REPEAT_NO_CONTEXT
+    assert corpus_reply("why", joke) == MORE_REPLIES["joke"]
+    for reply in MORE_REPLIES.values():
+        assert len(tok.encode(reply.encode())) < ACTION_MAX_TOKENS, reply
+    assert set(MORE_REPLIES) <= {i for i, _, _ in INTENTS}
+
+
+class _FakeClaude:
+    """Stands in for anthropic.Anthropic(): returns canned structured-output JSON."""
+
+    def __init__(self, *payloads):
+        from types import SimpleNamespace
+
+        self.payloads, self.requests = list(payloads), []
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        import json
+        from types import SimpleNamespace
+
+        self.requests.append(kwargs)
+        return SimpleNamespace(stop_reason="end_turn",
+                               content=[SimpleNamespace(type="text", text=json.dumps(self.payloads.pop(0)))])
+
+
+def test_claude_teacher_reviews_chats_and_writes_lessons():
+    from app.evolution.teacher import ChatTurn, ClaudeTeacher
+
+    fake = _FakeClaude(
+        {"reviews": [{"index": 0, "verdict": "good", "better_reply": "Hello!", "confidence": 0.9},
+                     {"index": 1, "verdict": "bad", "better_reply": "The capital of France is Paris.", "confidence": 0.95},
+                     {"index": 2, "verdict": "bad", "better_reply": "x" * 300, "confidence": 0.9}]},   # unusable
+        {"lessons": [{"topic": "Capital of France", "phrasings": ["What is the capital of France?", "capital of france",
+                                                                  "where is paris"], "reply": "Paris is the capital."},
+                     {"topic": "bad", "phrasings": ["only one"], "reply": "No."}]})
+    t = ClaudeTeacher(fake, model="claude-opus-5-5")
+    reviews = t.review_chats([ChatTurn(None, "hi", "Hello!"), ChatTurn(None, "capital of france?", "I like blue."),
+                              ChatTurn(None, "x", "y")])
+    assert reviews[0].verdict == "good" and reviews[1].better_reply == "The capital of France is Paris."
+    assert reviews[2] is None
+    req = fake.requests[0]
+    assert req["model"] == "claude-opus-5-5" and req["output_config"]["format"]["type"] == "json_schema"
+    assert "Turn 1:" in req["messages"][0]["content"] and "LISA" in req["system"]
+    lessons = t.lessons(5, ["greet"])
+    assert [l.topic for l in lessons] == ["Capital of France"]
+    assert lessons[0].phrasings[0] == "what is the capital of france" and t.calls == 2
+
+
+def test_chat_logs_are_curated_by_you_then_the_corpus_then_the_teacher():
+    from app.evolution.curator import curate_chats
+    from app.evolution.teacher import ChatReview, RuleTeacher
+
+    class Teacher(RuleTeacher):
+        name = "claude-opus-5-5"
+
+        def __init__(self):
+            self.asked = []
+
+        def review_chats(self, turns, batch=20):
+            self.asked += [t.message for t in turns]
+            return [ChatReview(index=0, verdict="bad", better_reply="The capital of France is Paris.", confidence=0.9)
+                    for _ in turns]
+
+    def log(i, msg, out, reward=None, prev=None):
+        prompt = (f"<l>{prev}<u>{msg}<l>" if prev else f"<u>{msg}<l>")
+        return {"id": i, "node_id": "n", "prompt": prompt, "model_output": out, "reward": reward,
+                "payload": {"task": "chat"}, "model_version": 4}
+
+    joke = "Why did the computer go to the doctor? Because it had a virus!"
+    logs = [log(1, "hello", "Hello! I'm LISA. How can I help you today?"),                 # corpus agrees
+            log(2, "how are you", "I like blue, like the little LED on my board."),           # corpus corrects
+            log(3, "what is the capital of france", "I don't know that yet.", reward=None),  # teacher teaches
+            log(4, "do you like pizza", "I like pizza!", reward=1.0),                         # you: /good
+            log(5, "say that again", "Goodbye!", prev=joke)]                                  # memory: repeat
+    stats = {"chat_real_log": 0, "chat_failure_recovery": 0, "chat_skipped": 0, "chat_review": []}
+    t = Teacher()
+    rows = {r["source_log_id"]: r for r in curate_chats(logs, t, stats)}
+    assert t.asked == ["what is the capital of france", "do you like pizza"]   # only what the corpus can't answer
+    assert rows[1]["source_type"] == "real_log" and rows[1]["teacher"] == "chat_corpus"
+    assert rows[2]["target_response"].startswith("I'm doing well") and rows[2]["source_type"] == "failure_recovery"
+    assert rows[3]["target_response"] == "The capital of France is Paris." and rows[3]["teacher"] == "claude-opus-5-5"
+    assert rows[4]["target_response"] == "I like pizza!" and rows[4]["teacher"] == "user"
+    assert rows[5]["target_response"] == joke and rows[5]["prompt"].startswith("<l>")
+    assert stats["chat_real_log"] == 2 and stats["chat_failure_recovery"] == 3 and len(stats["chat_review"]) == 5

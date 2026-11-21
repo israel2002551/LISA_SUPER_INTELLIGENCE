@@ -53,6 +53,8 @@ static const uint32_t kEdgeBaudCandidates[] = {9600, 115200, 921600, 2000000};
 //   Prompt + action must fit GEMMA_MAX_CONTEXT_LENGTH (128); checked in inference_task.h.
 #define EDGE_EVENT_MAX_CHARS          120
 #define EDGE_CHAT_MAX_CHARS           150   // bytes of a chat message kept (server: CHAT_MAX_CHARS)
+#define EDGE_CHAT_HISTORY_MAX_BYTES   160   // her last reply joins the prompt only if it all fits (CHAT_HISTORY_MAX_BYTES)
+#define EDGE_CHAT_MEMORY_MS        600000   // she forgets her last reply after 10 minutes (or /new)
 #define EDGE_PROMPT_MAX_TOKENS        80    // including BOS
 #define EDGE_ACTION_MAX_TOKENS        48
 

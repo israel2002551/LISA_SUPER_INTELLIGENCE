@@ -54,6 +54,14 @@ def test_prompt_contract_and_slot_size_match_firmware():
     assert num(e["EDGE_CHAT_MAX_CHARS"]) == CHAT_MAX_CHARS
     schema = (REPO_ROOT / "edge" / "action_schema.h").read_text(encoding="utf-8")
     assert '"<u>%s<l>"' in schema                      # build_chat_prompt's tags
+    from app.evolution.model_spec import CHAT_HISTORY_MAX_BYTES
+    assert num(e["EDGE_CHAT_HISTORY_MAX_BYTES"]) == CHAT_HISTORY_MAX_BYTES
+    assert '"<l>%s<u>%s<l>"' in schema and "9 + pl + tl <= EDGE_CHAT_HISTORY_MAX_BYTES" in schema   # memory
+    import re
+    from app.evolution.prompt_format import FOLLOWUPS
+    block = schema[schema.index("kChatFollowups[] = {"):]
+    assert tuple(re.findall(r'"([^"]+)"', block[:block.index("};")])) == FOLLOWUPS   # memory only for these
+    assert "edge_is_followup(t)" in schema
     layout = defines(REPO_ROOT / "edge" / "w25q_layout.h")
     assert num(layout["W25_SLOT_BYTES"]) == W25_SLOT_BYTES
 

@@ -6,7 +6,9 @@ RuleTeacher   deterministic, free. Uses rules the peripheral declared in its
 ClaudeTeacher RuleTeacher first; when no rule decides, asks Claude (structured
               JSON output) and keeps the answer only if it passes the device's
               manifest validation. Capped per evolution run. Also classifies
-              unknown UART streams for /api/v1/uart/classify.
+              unknown UART streams for /api/v1/uart/classify, reviews LISA's
+              real chat replies (good, or the reply she should have given),
+              and teaches her new conversation topics (lessons).
 
 Rule grammar:
   {"when": {"ev": "temp", "field": "v", "gt": 30}, "do": {"cmd": "set_fan", "args": {"level": 2}}}
@@ -193,6 +195,125 @@ Given a hex dump, the baud rate and a heuristic format guess, describe the wire 
 what it most likely needs from a host controller, and the data fields you can see. Use format "unknown" and a low
 confidence when the bytes don't support a conclusion."""
 
+# ---------------------------------------------------------------------------
+# Chat teaching: review LISA's real replies, and teach her new topics
+# ---------------------------------------------------------------------------
+LISA_PERSONA = """LISA is a tiny AI: a 2.75-million-parameter language model running on an ESP32-S3 microcontroller,
+with her weights on a W25Q128 flash chip. She controls a smart thermostat: above 30 degrees she sets the fan to
+level 2, below 15 degrees to level 0, otherwise she does nothing. She learns because her evolution server retrains
+her on what happens and sends signed updates over Wi-Fi; she tests each update and rolls back if it fails. She chats
+over a USB serial console and remembers only her previous answer. She can't see, hear, move, browse the web or read
+a clock, and she only understands simple English. She is friendly, honest about her limits, and brief."""
+
+REPLY_RULES = """A reply LISA should give is: one line, at most 120 characters, plain ASCII, in the first person as
+LISA, in simple words. For simple, stable facts give the short correct answer (e.g. "The capital of France is
+Paris."). For things she can't know or do (news, prices, the current time, the web, political or religious
+opinions), say so kindly."""
+
+CHAT_REVIEW_SYSTEM = f"""You review LISA's replies in real conversations; your reviews become her training data.
+{LISA_PERSONA}
+
+Each numbered turn has her previous reply (if any), the user's message, and LISA's reply.
+- verdict "good": a sensible, truthful, friendly answer to the message in LISA's voice. It doesn't have to be the
+  reply you would write.
+- verdict "bad": off-topic, wrong, garbled, repetitive or unhelpful.
+- better_reply: the reply LISA should give. For a "good" verdict, repeat her reply exactly.
+- confidence: 0 to 1.
+{REPLY_RULES}"""
+
+LESSONS_SYSTEM = f"""You teach LISA new conversation topics; your lessons become her training data.
+{LISA_PERSONA}
+
+Give each topic a short name, 5 to 8 different ways a person might say it (lowercase, no end punctuation, under
+60 characters each), and the one reply LISA should give. Choose useful, everyday topics a friendly home assistant
+should handle: simple stable facts, kindness, everyday help, fun facts. Every phrasing must clearly belong to its
+own topic only. Skip time-sensitive facts, opinions, and anything she can't do.
+{REPLY_RULES}"""
+
+CHAT_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reviews": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "verdict": {"type": "string", "enum": ["good", "bad"]},
+                    "better_reply": {"type": "string"},
+                    "confidence": {"type": "number", "description": "0 to 1."},
+                },
+                "required": ["index", "verdict", "better_reply", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["reviews"],
+    "additionalProperties": False,
+}
+
+LESSONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "lessons": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string"},
+                    "phrasings": {"type": "array", "items": {"type": "string"}},
+                    "reply": {"type": "string"},
+                },
+                "required": ["topic", "phrasings", "reply"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["lessons"],
+    "additionalProperties": False,
+}
+
+
+class ChatReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    index: int
+    verdict: Literal["good", "bad"]
+    better_reply: str
+    confidence: float
+
+
+class _ChatReviews(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reviews: list[ChatReview]
+
+
+class Lesson(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    topic: str
+    phrasings: list[str]
+    reply: str
+
+
+class _Lessons(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    lessons: list[Lesson]
+
+
+@dataclass(frozen=True)
+class ChatTurn:
+    prev_reply: str | None
+    message: str
+    reply: str
+
+
+def clean_reply(text: str, max_chars: int = 120) -> str | None:
+    """A reply fit to train on: one line, printable ASCII, 1..max_chars characters."""
+    t = " ".join((text or "").split())
+    if not t or len(t) > max_chars or not all(32 <= ord(c) < 127 for c in t):
+        return None
+    return t
+
+
 REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 REFUSAL_FALLBACKS = [{"model": "claude-opus-4-8"}]
 
@@ -271,6 +392,47 @@ class ClaudeTeacher:
             return None
         verdict, target, _why = validate_action(dev.manifest, json.dumps({"cmd": d.cmd, "args": args}))
         return Label(target, self.name, d.confidence) if verdict == "ok" and target else None
+
+    def review_chats(self, turns: list[ChatTurn], batch: int = 20) -> list[ChatReview | None]:
+        """One review per turn (None where Claude gave none, or an unusable one)."""
+        out: list[ChatReview | None] = [None] * len(turns)
+        for start in range(0, len(turns), batch):
+            chunk = turns[start:start + batch]
+            user = "\n\n".join(
+                f"Turn {i}:\nHer previous reply: {t.prev_reply or '(none)'}\nUser: {t.message}\nLISA: {t.reply or '(no reply)'}"
+                for i, t in enumerate(chunk))
+            text = self._ask(CHAT_REVIEW_SYSTEM, user, CHAT_REVIEW_SCHEMA)
+            if text is None:
+                continue
+            try:
+                reviews = _ChatReviews.model_validate_json(text).reviews
+            except ValidationError:
+                continue
+            for r in reviews:
+                better = clean_reply(r.better_reply)
+                if 0 <= r.index < len(chunk) and better and r.confidence >= self.min_confidence:
+                    out[start + r.index] = r.model_copy(update={"better_reply": better})
+        return out
+
+    def lessons(self, n: int, known_topics: list[str]) -> list[Lesson]:
+        """Up to n new topics to teach, each with phrasings and LISA's reply."""
+        if n <= 0:
+            return []
+        user = (f"Teach LISA {n} new topics. She already knows: {', '.join(known_topics)}.")
+        text = self._ask(LESSONS_SYSTEM, user, LESSONS_SCHEMA)
+        if text is None:
+            return []
+        try:
+            lessons = _Lessons.model_validate_json(text).lessons
+        except ValidationError:
+            return []
+        good = []
+        for lesson in lessons[:n]:
+            reply = clean_reply(lesson.reply)
+            phrasings = [p for p in (clean_reply(p.lower().rstrip("?!. "), 60) for p in lesson.phrasings) if p]
+            if reply and len(phrasings) >= 3 and lesson.topic.strip():
+                good.append(Lesson(topic=lesson.topic.strip()[:40], phrasings=phrasings[:8], reply=reply))
+        return good
 
     def classify_stream(self, sample: bytes, baud: int, format_guess: str) -> StreamClassification | None:
         user = f"Baud: {baud}\nHeuristic format guess: {format_guess}\nFirst {len(sample)} bytes (hex):\n{sample.hex()}"

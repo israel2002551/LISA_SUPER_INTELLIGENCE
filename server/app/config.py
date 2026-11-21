@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     lora_rank: int = 8
     freeze_embeddings: bool = True                     # keeps OTA deltas ~2 MiB smaller
     chat_enabled: bool = True                          # train the conversation corpus (chat_corpus.py) too
+    teacher_lessons_per_run: int = 5                   # new topics the Claude teacher writes per run (1 call)
     gate_max_task_regression: float = 0.05             # no task (actions, chat) may lose more exact match than this
     gate_min_improvement: float = 0.0                  # exact-match gain needed to publish
     gate_min_val_examples: int = 20                    # fewer can't separate learning from "always the majority answer"
