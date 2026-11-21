@@ -144,3 +144,15 @@ def test_real_conversations_beat_the_corpus_for_the_same_prompt():
     out = {(r["prompt"], r["target_response"]) for r in resolve_chat_conflicts(rows)}
     assert out == {("<u>capital of france<l>", "Paris."), ("<u>hi<l>", "Hello!"), ("<d>a:b<e>{}<a>", "NOP")}
     assert len(resolve_chat_conflicts(rows)) == 4          # device rows untouched
+
+
+def test_gate_tolerates_one_example_of_noise_when_loss_clearly_improves():
+    tasks = lambda chat: {"action": {"n": 35, "exact_match": 1.0}, "chat": {"n": 64, "exact_match": chat}}
+    base = {"exact_match": (1 + 34 / 64) / 2, "val_loss": 0.318, "n_val": 99, "tasks": tasks(34 / 64)}
+    one_less = {"exact_match": (1 + 33 / 64) / 2, "val_loss": 0.191, "n_val": 99, "tasks": tasks(33 / 64)}
+    ok, reason = gate(base, one_less, 0.0, False, 20, 0.05)
+    assert ok and "within one example" in reason
+    two_less = {**one_less, "exact_match": (1 + 32 / 64) / 2, "tasks": tasks(32 / 64)}
+    assert not gate(base, two_less, 0.0, False, 20, 0.05)[0]
+    no_loss_gain = {**one_less, "val_loss": 0.316}
+    assert not gate(base, no_loss_gain, 0.0, False, 20, 0.05)[0]

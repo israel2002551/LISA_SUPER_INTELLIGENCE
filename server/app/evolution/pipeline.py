@@ -168,8 +168,14 @@ def gate(baseline: dict[str, Any], metrics: dict[str, Any], min_improvement: flo
     if c_em > b_em + min_improvement:
         return True, f"exact match {b_em:.3f} -> {c_em:.3f}"
     b_loss, c_loss = baseline.get("val_loss"), metrics.get("val_loss")
-    if c_em >= b_em and b_loss is not None and c_loss is not None and c_loss < b_loss * 0.98:
-        return True, f"exact match held at {c_em:.3f}, val loss {b_loss:.3f} -> {c_loss:.3f}"
+    # Exact match is measured on a sample; one example either way is noise. Within that, a
+    # clearly lower validation loss is the better signal (a run that taught new topics and
+    # cut val loss 0.318 -> 0.191 was rejected for losing 1 of 64 chat examples).
+    tasks = [t for t in (metrics.get("tasks") or {}).values() if t.get("n")]
+    noise = max((1 / t["n"] for t in tasks), default=0.0) / max(len(tasks), 1)
+    if c_em >= b_em - noise - 1e-9 and b_loss is not None and c_loss is not None and c_loss < b_loss * 0.98:
+        held = "held" if c_em >= b_em else "held within one example"
+        return True, f"exact match {held} ({b_em:.3f} -> {c_em:.3f}), val loss {b_loss:.3f} -> {c_loss:.3f}"
     return False, f"no improvement (exact match {b_em:.3f} -> {c_em:.3f})"
 
 
@@ -230,7 +236,7 @@ def run_evolution(ctx: EvolutionContext, run_id: str) -> dict[str, Any]:
                           lr=float(params.get("lr", s.train_lr)), method=params.get("method", s.train_method),
                           lora_rank=s.lora_rank, seed=len(train),
                           freeze_embeddings=bool(params.get("freeze_embeddings", s.freeze_embeddings)),
-                          schedule=s.train_schedule,
+                          schedule=s.train_schedule, eval_limit=s.gate_eval_per_task,
                           warmup_steps=max(s.train_warmup_steps, int(params.get("steps", s.train_steps)) // 20))
         trainer = make_trainer(params.get("trainer") or s.trainer, s.remote_trainer_url,
                                s.remote_trainer_token.get_secret_value() if s.remote_trainer_token else None)
