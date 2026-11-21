@@ -171,9 +171,11 @@ def gate(baseline: dict[str, Any], metrics: dict[str, Any], min_improvement: flo
     # Exact match is measured on a sample; one example either way is noise. Within that, a
     # clearly lower validation loss is the better signal (a run that taught new topics and
     # cut val loss 0.318 -> 0.191 was rejected for losing 1 of 64 chat examples).
-    tasks = [t for t in (metrics.get("tasks") or {}).values() if t.get("n")]
-    noise = max((1 / t["n"] for t in tasks), default=0.0) / max(len(tasks), 1)
-    if c_em >= b_em - noise - 1e-9 and b_loss is not None and c_loss is not None and c_loss < b_loss * 0.98:
+    b_tasks, c_tasks = baseline.get("tasks") or {}, metrics.get("tasks") or {}
+    within_one = all(c_tasks[t]["exact_match"] >= b["exact_match"] - 1 / c_tasks[t]["n"] - 1e-9
+                     for t, b in b_tasks.items() if c_tasks.get(t, {}).get("n"))
+    held_overall = c_em >= b_em if not b_tasks else within_one
+    if held_overall and b_loss is not None and c_loss is not None and c_loss < b_loss * 0.98:
         held = "held" if c_em >= b_em else "held within one example"
         return True, f"exact match {held} ({b_em:.3f} -> {c_em:.3f}), val loss {b_loss:.3f} -> {c_loss:.3f}"
     return False, f"no improvement (exact match {b_em:.3f} -> {c_em:.3f})"

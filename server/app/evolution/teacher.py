@@ -229,6 +229,8 @@ Give each topic a short name, 5 to 8 different ways a person might say it (lower
 60 characters each), and the one reply LISA should give. Choose useful, everyday topics a friendly home assistant
 should handle: simple stable facts, kindness, everyday help, fun facts. Every phrasing must clearly belong to its
 own topic only. Skip time-sensitive facts, opinions, and anything she can't do.
+Only teach general knowledge. Never teach anything about LISA herself, her devices, her commands or what she can
+do: her own lessons cover that, and a wrong claim about herself is worse than none.
 {REPLY_RULES}"""
 
 CHAT_REVIEW_SCHEMA = {

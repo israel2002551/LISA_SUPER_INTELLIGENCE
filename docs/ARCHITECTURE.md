@@ -207,7 +207,13 @@ Why only follow-ups: we first gave context to every message. On the board, 4 of 
    - `TorchTrainer` fine-tunes the exact firmware architecture on CPU (full or LoRA, merged).
    - The token table is frozen by default, which saves ~2 MiB per OTA delta.
    - Examples whose target can't fit the 48-token budget are skipped, not truncated.
-4. **Gate.** The candidate must beat its parent on the same validation split (exact match, or equal exact match with ≥2 % lower loss). A failed gate means `rejected`: nothing ships.
+4. **Gate.** The candidate is compared with the active model on the same validation split, 128 examples per task in a stable shuffle. It must either:
+   - beat the active model on exact match, or
+   - hold exact match within one example *per task* (sampling noise) and have ≥2 % lower validation loss.
+
+   No task may lose more than 0.05. A failed gate means `rejected`: nothing ships.
+
+   **Lessons** from the teacher model are general knowledge only. One early lesson invented a chat command for the fan, so claims about LISA herself come only from her own corpus.
 5. **Quantize.** The candidate is quantized to the INT16 image and checked against the 6 MiB slot and the PSRAM budget.
 6. **Publish.** The server uploads `v{n}.w25img`. It also builds a W25D block delta against the parent if that's ≤70 % of the full size. It signs the manifest and activates the version.
 

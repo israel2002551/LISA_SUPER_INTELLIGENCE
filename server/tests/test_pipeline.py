@@ -156,3 +156,13 @@ def test_gate_tolerates_one_example_of_noise_when_loss_clearly_improves():
     assert not gate(base, two_less, 0.0, False, 20, 0.05)[0]
     no_loss_gain = {**one_less, "val_loss": 0.316}
     assert not gate(base, no_loss_gain, 0.0, False, 20, 0.05)[0]
+
+
+def test_gate_noise_tolerance_is_one_example_per_task():
+    # The v7 run: chat lost 3 of 128, which a tolerance taken from the 37-example device task let through.
+    tasks = lambda chat: {"action": {"n": 37, "exact_match": 1.0}, "chat": {"n": 128, "exact_match": chat}}
+    base = {"exact_match": (1 + 66 / 128) / 2, "val_loss": 0.297, "n_val": 165, "tasks": tasks(66 / 128)}
+    three_less = {"exact_match": (1 + 63 / 128) / 2, "val_loss": 0.192, "n_val": 165, "tasks": tasks(63 / 128)}
+    assert not gate(base, three_less, 0.0, False, 20, 0.05)[0]
+    one_less = {**three_less, "exact_match": (1 + 65 / 128) / 2, "tasks": tasks(65 / 128)}
+    assert gate(base, one_less, 0.0, False, 20, 0.05)[0]
