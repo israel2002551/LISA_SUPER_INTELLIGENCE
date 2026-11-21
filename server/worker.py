@@ -61,6 +61,7 @@ def main() -> None:
     parser.add_argument("--base-version", type=int, help="with --trigger: train from this model version instead of "
                         "the active one (the gate still compares with the active one)")
     parser.add_argument("--steps", type=int, help="with --trigger: training steps for this run")
+    parser.add_argument("--lr", type=float, help="with --trigger: learning rate for this run (lower = less forgetting)")
     parser.add_argument("--unfreeze-embeddings", action="store_true",
                         help="with --trigger: also train the token embeddings (retraining from scratch)")
     args = parser.parse_args()
@@ -71,7 +72,7 @@ def main() -> None:
         log.warning("Worker in dev mode has its own in-memory database; it can't see the web service's data.")
     if args.trigger:
         params = {k: v for k, v in {"force_publish": True if args.force else None, "base_version": args.base_version,
-                                    "steps": args.steps,
+                                    "steps": args.steps, "lr": args.lr,
                                     "freeze_embeddings": False if args.unfreeze_embeddings else None}.items()
                   if v is not None}
         run = create_run(ctx, "manual", params)

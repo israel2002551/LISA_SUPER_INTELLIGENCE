@@ -46,6 +46,15 @@ def example_row(prompt: str, target: str, source_type: str, teacher: str, qualit
     }
 
 
+def same_answer(a: str, b: str) -> bool:
+    """True if one answer contains the other, ignoring case and punctuation (\"Paris is the capital.\"
+    vs \"I know Paris is the capital.\"). Deliberately no fuzzy similarity: \"Jupiter is the largest
+    planet\" and \"Saturn is the largest planet\" are 90 % alike and must stay a correction."""
+    norm = lambda t: " ".join("".join(c for c in t.lower() if c.isalnum() or c.isspace()).split())
+    x, y = norm(a), norm(b)
+    return bool(x) and bool(y) and (x in y or y in x)
+
+
 def _is_chat(log_row: dict[str, Any]) -> bool:
     return (log_row.get("payload") or {}).get("task") == "chat" or is_chat_prompt((log_row.get("prompt") or "").encode())
 
@@ -92,7 +101,8 @@ def curate_chats(logs: list[dict[str, Any]], teacher: Teacher, stats: dict[str, 
             target, source, who, why = known, "real_log" if ok else "failure_recovery", "chat_corpus", \
                 "matches her lessons" if ok else "her lessons say otherwise"
         elif review is not None:
-            ok = review.verdict == "good"
+            # A "better" reply that only rewords hers is agreement: retraining on it churns her.
+            ok = review.verdict == "good" or same_answer(t.reply, review.better_reply)
             target = t.reply if ok else review.better_reply
             source, who, why = ("real_log" if ok else "failure_recovery"), teacher_name, f"teacher: {review.verdict}"
         else:

@@ -419,3 +419,25 @@ def test_groq_teacher_config():
     assert isinstance(t, OpenAICompatibleTeacher) and t.model == "openai/gpt-oss-120b"
     t = make_teacher(Settings(_env_file=None, teacher="groq", groq_api_key="gsk_x", teacher_model="openai/gpt-oss-20b"))
     assert t.model == "openai/gpt-oss-20b"
+
+
+def test_teacher_rewording_a_correct_reply_counts_as_agreement():
+    from app.evolution.curator import curate_chats, same_answer
+    from app.evolution.teacher import ChatReview, RuleTeacher
+
+    assert same_answer("The capital of France is Paris.", "I know the capital of France is Paris.")
+    assert not same_answer("I don't have pets, but my thermostat keeps me company.", "I don't eat, so I have no opinion on pizza.")
+    assert not same_answer("Saturn is the largest planet in the solar system.", "Jupiter is the largest planet in the solar system.")
+
+    class Teacher(RuleTeacher):
+        name = "groq/openai/gpt-oss-120b"
+
+        def review_chats(self, turns, batch=20):
+            return [ChatReview(index=0, verdict="bad", better_reply="I know blue light scatters more, so the sky looks blue.",
+                               confidence=0.9) for _ in turns]
+
+    log = {"id": 1, "node_id": "n", "prompt": "<u>why is the sky blue<l>", "reward": None, "payload": {"task": "chat"},
+           "model_output": "Blue light scatters more, so the sky looks blue.", "model_version": 8}
+    stats = {"chat_real_log": 0, "chat_failure_recovery": 0, "chat_skipped": 0, "chat_review": []}
+    (row,) = curate_chats([log], Teacher(), stats)
+    assert row["source_type"] == "real_log" and row["target_response"] == log["model_output"]

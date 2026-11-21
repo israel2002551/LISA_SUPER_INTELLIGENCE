@@ -63,6 +63,7 @@ static const uint32_t kEdgeBaudCandidates[] = {9600, 115200, 921600, 2000000};
 #define EDGE_TELEMETRY_BATCH_BYTES    12000
 #define EDGE_HEARTBEAT_INTERVAL_MS    60000
 #define EDGE_OTA_CHECK_INTERVAL_MS    300000
+#define EDGE_OTA_MAX_BACKOFF_MS     14400000   // after failed downloads, retry the same version at most every 4 h
 #define EDGE_HTTP_TIMEOUT_MS          15000
 #define EDGE_WIFI_RETRY_MS            30000   // phone hotspots can take >10 s to accept a client
 

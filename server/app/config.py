@@ -56,9 +56,12 @@ class Settings(BaseSettings):
     min_train_examples: int = 32
     # Measured on the real sim-thermo dataset (374 train / 35 val), 1200 steps from v1:
     #   1e-3 cosine -> 0.97 exact match;  3e-3 cosine -> 0.57-0.66 (memorizes);  3e-3 constant -> 0.00-0.34
-    train_steps: int = 1200
+    #   Continuing from the active model (the normal run), 1500 steps at 5e-4 learned new topics
+    #   without forgetting (chat 0.516 -> 0.539); 2000 at 1e-3 lost 3/128 old answers twice.
+    #   Retraining from scratch (worker --base-version 1 --unfreeze-embeddings): --steps 3000 --lr 1e-3.
+    train_steps: int = 1500
     train_batch_size: int = 16
-    train_lr: float = 1e-3
+    train_lr: float = 5e-4
     train_schedule: Literal["constant", "cosine"] = "cosine"
     train_warmup_steps: int = 60
     train_method: Literal["full", "lora"] = "full"
