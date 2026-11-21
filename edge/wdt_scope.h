@@ -32,6 +32,29 @@ private:
     bool idle_removed_ = false;
 };
 
+// Inside an OtaWatchdogScope, hands the watchdog back to IDLE0 for a blocking network call
+// (a TLS handshake can take longer than 5 s, and the task can't feed while it blocks).
+// Outside a scope it does nothing.
+class OtaWatchdogPause {
+public:
+    OtaWatchdogPause() {
+        idle0_ = xTaskGetIdleTaskHandleForCPU(0);
+        self_removed_ = esp_task_wdt_delete(nullptr) == ESP_OK;
+        idle_added_ = self_removed_ && idle0_ && esp_task_wdt_add(idle0_) == ESP_OK;
+    }
+    ~OtaWatchdogPause() {
+        if (idle_added_) esp_task_wdt_delete(idle0_);
+        if (self_removed_) esp_task_wdt_add(nullptr);
+    }
+    OtaWatchdogPause(const OtaWatchdogPause&) = delete;
+    OtaWatchdogPause& operator=(const OtaWatchdogPause&) = delete;
+
+private:
+    TaskHandle_t idle0_ = nullptr;
+    bool self_removed_ = false;
+    bool idle_added_ = false;
+};
+
 // Feeds the watchdog for the calling task if it is subscribed (inside an OtaWatchdogScope);
 // otherwise a harmless no-op (returns ESP_ERR_NOT_FOUND).
 static inline void wdt_feed() { esp_task_wdt_reset(); }

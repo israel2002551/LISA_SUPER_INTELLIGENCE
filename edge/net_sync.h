@@ -381,28 +381,20 @@ private:
         bool ok = with_flash_watchdog([&] { return slots_->erase_staging(size); });
         if (!ok) log_ota("failed", version, "erase failed");
 
-        std::unique_ptr<WiFiClient> client = ok ? make_client(url) : nullptr;
-        HTTPClient http;
-        if (ok) {
-            ok = client && http.begin(*client, url);
-            http.setTimeout(EDGE_HTTP_TIMEOUT_MS);
-            int code = ok ? http.GET() : -1;
-            int len = code == 200 ? http.getSize() : -1;
-            if (code != 200 || len <= 0) {
-                // len <= 0 means chunked or unknown length; storage serves Content-Length.
-                ok = false;
-                snprintf(msg, sizeof(msg), "download HTTP %d, length %d", code, len);
-                log_ota("failed", version, msg);
-            }
+        Download dl(url);
+        if (ok && dl.open() <= 0) {
+            ok = false;
+            snprintf(msg, sizeof(msg), "download: %s", dl.err());
+            log_ota("failed", version, msg);
         }
         if (ok) {
-            WiFiClient* s = http.getStreamPtr();
             ok = with_flash_watchdog([&] {
-                return strcmp(kind, "delta") == 0 ? apply_delta(http, s, size, sha) : copy_full(http, s, size);
+                return strcmp(kind, "delta") == 0 ? apply_delta(dl, size, sha) : copy_full(dl, size);
             });
             if (!ok) log_ota("failed", version, "transfer or patch failed");
+            else if (dl.resumes()) Serial.printf("[OTA] Downloaded with %d resume(s).\n", dl.resumes());
         }
-        http.end();
+        dl.close();
 
         if (ok && !with_flash_watchdog([&] { return slots_->finalize_staging(version, size, sha, false); })) {
             ok = false;
@@ -424,51 +416,117 @@ private:
         return work();
     }
 
-    // Why the last transfer failed, and how far it got (printed by the callers).
-    char xfer_err_[48] = "";
-    uint32_t xfer_bytes_ = 0;
+    // A model download that survives a weak link (seen on a phone hotspot: stalls after a few
+    // hundred KB at ~8 KB/s). When the stream goes quiet for EDGE_HTTP_TIMEOUT_MS or the server
+    // closes it, it reconnects and asks for the rest with an HTTP Range request (Supabase
+    // Storage answers 206 Partial Content), up to kMaxResumes times per download.
+    class Download {
+    public:
+        static const int kMaxResumes = 20;
 
-    // Bounded by EDGE_HTTP_TIMEOUT_MS of silence; feeds the watchdog while it waits.
-    bool read_exact(HTTPClient& http, WiFiClient* s, uint8_t* buf, size_t n) {
-        size_t got = 0;
-        uint32_t last = millis();
-        while (got < n) {
-            int avail = s->available();
-            if (avail > 0) {
-                int r = s->read(buf + got, min((size_t)avail, n - got));
-                if (r > 0) {
-                    got += r;
-                    xfer_bytes_ += r;
-                    last = millis();
-                }
-            } else {
-                if (!http.connected()) {
-                    snprintf(xfer_err_, sizeof(xfer_err_), "the server closed the connection");
-                    return false;
-                }
-                if (millis() - last > EDGE_HTTP_TIMEOUT_MS) {
-                    snprintf(xfer_err_, sizeof(xfer_err_), "no data for %u s", (unsigned)(EDGE_HTTP_TIMEOUT_MS / 1000));
-                    return false;
-                }
-                wdt_feed();
-                delay(2);
-            }
+        explicit Download(const char* url) : url_(url) {}
+        ~Download() { close(); }
+
+        // Opens at byte 0. Returns the file length, or -1 (err() says why).
+        int32_t open() {
+            pos_ = 0;
+            total_ = -1;
+            return connect() ? total_ : -1;
         }
-        return true;
-    }
 
-    bool copy_full(HTTPClient& http, WiFiClient* s, uint32_t size) {
-        xfer_bytes_ = 0;
-        xfer_err_[0] = '\0';
-        if ((uint32_t)http.getSize() != size) {
-            Serial.printf("[OTA] Download is %d bytes, expected %u\n", http.getSize(), (unsigned)size);
+        // Feeds the watchdog while waiting; resumes transparently.
+        bool read_exact(uint8_t* buf, size_t n) {
+            size_t got = 0;
+            while (got < n) {
+                WiFiClient* s = http_.getStreamPtr();
+                uint32_t last = millis();
+                while (got < n && s) {
+                    int avail = s->available();
+                    if (avail > 0) {
+                        int r = s->read(buf + got, min((size_t)avail, n - got));
+                        if (r > 0) {
+                            got += r;
+                            pos_ += r;
+                            last = millis();
+                        }
+                    } else if (!http_.connected()) {
+                        snprintf(err_, sizeof(err_), "the server closed the connection");
+                        break;
+                    } else if (millis() - last > EDGE_HTTP_TIMEOUT_MS) {
+                        snprintf(err_, sizeof(err_), "no data for %u s", (unsigned)(EDGE_HTTP_TIMEOUT_MS / 1000));
+                        break;
+                    } else {
+                        wdt_feed();
+                        delay(2);
+                    }
+                }
+                if (got == n) return true;
+                if (!s) snprintf(err_, sizeof(err_), "no download stream");
+                if (resumes_ >= kMaxResumes) return false;
+                resumes_++;
+                Serial.printf("[OTA] %s at %u/%d bytes; resuming (%d/%d)\n", err_, (unsigned)pos_, (int)total_, resumes_,
+                              kMaxResumes);
+                if (!connect()) return false;
+            }
+            return true;
+        }
+
+        void close() {
+            http_.end();
+            client_.reset();
+        }
+        uint32_t pos() const { return pos_; }
+        int32_t total() const { return total_; }
+        int resumes() const { return resumes_; }
+        const char* err() const { return err_; }
+
+    private:
+        // GET from pos_ (a Range request after the first byte), with a few tries 3 s apart.
+        bool connect() {
+            close();
+            OtaWatchdogPause pause;   // a TLS handshake can block longer than the watchdog allows
+            for (int attempt = 0; attempt < 3; attempt++) {
+                if (attempt) delay(3000);
+                client_ = make_client(url_);
+                if (!client_ || !http_.begin(*client_, url_)) {
+                    snprintf(err_, sizeof(err_), "could not start HTTPS");
+                    continue;
+                }
+                http_.setTimeout(EDGE_HTTP_TIMEOUT_MS);
+                if (pos_ > 0) http_.addHeader("Range", "bytes=" + String(pos_) + "-");
+                int code = http_.GET();
+                int len = http_.getSize();
+                // len <= 0 would mean chunked or unknown length; Storage serves Content-Length.
+                if (pos_ == 0 && code == 200 && len > 0) {
+                    total_ = len;
+                    return true;
+                }
+                if (pos_ > 0 && code == 206 && len == total_ - (int32_t)pos_) return true;
+                snprintf(err_, sizeof(err_), "HTTP %d, length %d", code, len);
+                close();
+            }
+            return false;
+        }
+
+        String url_;
+        std::unique_ptr<WiFiClient> client_;
+        HTTPClient http_;
+        uint32_t pos_ = 0;
+        int32_t total_ = -1;
+        int resumes_ = 0;
+        char err_[48] = "";
+    };
+
+    bool copy_full(Download& d, uint32_t size) {
+        if ((uint32_t)d.total() != size) {
+            Serial.printf("[OTA] Download is %d bytes, expected %u\n", (int)d.total(), (unsigned)size);
             return false;
         }
         static uint8_t buf[4096];
         for (uint32_t off = 0; off < size; off += sizeof(buf)) {
             uint32_t n = min((uint32_t)sizeof(buf), size - off);
-            if (!read_exact(http, s, buf, n)) {
-                Serial.printf("[OTA] Download stopped at %u/%u bytes: %s\n", (unsigned)off, (unsigned)size, xfer_err_);
+            if (!d.read_exact(buf, n)) {
+                Serial.printf("[OTA] Download stopped at %u/%u bytes: %s\n", (unsigned)off, (unsigned)size, d.err());
                 return false;
             }
             if (!slots_->write_staging(off, buf, n)) {
@@ -483,12 +541,10 @@ private:
 
     // Block delta (server/app/evolution/delta.py): unchanged 4 KiB blocks are copied
     // from the active slot, changed ones come from the stream.
-    bool apply_delta(HTTPClient& http, WiFiClient* s, uint32_t size, const uint8_t target_sha[32]) {
-        xfer_bytes_ = 0;
-        xfer_err_[0] = '\0';
+    bool apply_delta(Download& d, uint32_t size, const uint8_t target_sha[32]) {
         uint8_t hdr[W25_DELTA_HEADER_BYTES];
-        if (!read_exact(http, s, hdr, sizeof(hdr))) {
-            Serial.printf("[OTA] Delta header not received: %s\n", xfer_err_);
+        if (!d.read_exact(hdr, sizeof(hdr))) {
+            Serial.printf("[OTA] Delta header not received: %s\n", d.err());
             return false;
         }
         uint32_t magic, fmt, block, target_size, n_blocks;
@@ -508,8 +564,8 @@ private:
         }
         static uint8_t bitmap[(W25_SLOT_BYTES / 4096 + 7) / 8];
         uint32_t bitmap_len = (n_blocks + 7) / 8;
-        if (bitmap_len > sizeof(bitmap) || !read_exact(http, s, bitmap, bitmap_len)) {
-            Serial.printf("[OTA] Delta block map not received: %s\n", xfer_err_);
+        if (bitmap_len > sizeof(bitmap) || !d.read_exact(bitmap, bitmap_len)) {
+            Serial.printf("[OTA] Delta block map not received: %s\n", d.err());
             return false;
         }
 
@@ -520,12 +576,12 @@ private:
             uint32_t off = i * block;
             uint32_t n = min(block, size - off);
             bool changed = bitmap[i / 8] & (1u << (i % 8));
-            bool ok = changed ? read_exact(http, s, buf, n) : slots_->read_slot(src, off, buf, n);
+            bool ok = changed ? d.read_exact(buf, n) : slots_->read_slot(src, off, buf, n);
             if (!ok) {
                 Serial.printf("[OTA] Delta stopped at block %u/%u (%s), %u bytes received, %u s in: %s\n",
                               (unsigned)i, (unsigned)n_blocks, changed ? "downloading" : "copying from the active slot",
-                              (unsigned)xfer_bytes_, (unsigned)((millis() - t0) / 1000),
-                              changed ? xfer_err_ : "flash read failed");
+                              (unsigned)d.pos(), (unsigned)((millis() - t0) / 1000),
+                              changed ? d.err() : "flash read failed");
                 return false;
             }
             if (!slots_->write_staging(off, buf, n)) {

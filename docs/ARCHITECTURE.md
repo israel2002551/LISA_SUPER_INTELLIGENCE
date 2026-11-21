@@ -257,6 +257,10 @@ It also helps `/uart/classify` when the heuristics aren't confident.
   - **Training:** fine-tuned from v4 for 3000 steps with frozen embeddings, published as a 3.4 MB delta.
   - **On the board:** 12/14 in a scripted conversation with follow-ups. It fixed "what is your favorite food" (wrong on v4). "say that again" and "tell me more" work after jokes and about herself. Thermostat 12/12.
 - **OTA:** the v2→v3 delta was 3.4 MB of a 5.5 MB image. Erasing the 5.4 MB staging area took 14.8 s, longer than the 5 s task watchdog, so erase, patch and verify feed the watchdog from the net task (`edge/wdt_scope.h`). Model load from the W25Q into PSRAM takes 2.2 s.
+- **OTA on a weak phone hotspot:** seen as DNS failures, ~4-8 KB/s and 15 s stalls after a few hundred KB.
+  - **Resume:** downloads reconnect and continue with HTTP Range requests (Supabase Storage answers 206), up to 20 resumes per download. The watchdog is paused during each TLS reconnect.
+  - **Back-off:** after a failed download, the same version is retried at 10, 20, 40 min ... up to every 4 h.
+  - **Errors:** each failure prints the block, bytes and reason.
 
 Not yet measured on hardware: a physical UART peripheral (only the simulator so far) and ESP-NOW/TCP links.
 
